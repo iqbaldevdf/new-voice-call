@@ -1,244 +1,391 @@
+import React, { useRef, useState, useEffect, useCallback } from "react"
+import io from "socket.io-client"
+import { Device } from "mediasoup-client"
 
-import React, { useRef, useState } from "react";
-import io from "socket.io-client";
+const socket = io("http://localhost:3002")
 
-const SIGNALING_SERVER_URL =
-  window.location.hostname === "localhost"
-    ? "http://localhost:3002"
-    : "https://unvaccinated-tempie-depreciatively.ngrok-free.dev";
+export default function App() {
+  const localAudioRef = useRef(null)
+  const remoteAudioRef = useRef(null)
 
-function App() {
-  const [roomId, setRoomId] = useState("");
-  const [name, setName] = useState("");
-  const [remoteName, setRemoteName] = useState("");
-  const [joined, setJoined] = useState(false);
-  const [status, setStatus] = useState("");
-  const [callStarted, setCallStarted] = useState(false);
-  const [otherUserId, setOtherUserId] = useState(null);
-  const [micMuted, setMicMuted] = useState(false);
-  const [logs, setLogs] = useState([]);
-  const localAudioRef = useRef(null);
-  const remoteAudioRef = useRef(null);
-  const pcRef = useRef(null);
-  const socketRef = useRef(null);
-  const localStreamRef = useRef(null);
+  const deviceRef = useRef(null)
+  const sendTransportRef = useRef(null)
+  const recvTransportRef = useRef(null)
+  const hasJoinedRef = useRef(false)
+  const consumersRef = useRef({})
+
+  const [micOn, setMicOn] = useState(true)
+  const [joined, setJoined] = useState(false)
+  const [status, setStatus] = useState("idle")
+  const [log, setLog] = useState([])
 
   const addLog = (msg) => {
-    setLogs((prev) => [...prev, `[${new Date().toLocaleTimeString()}] ${msg}`]);
-  };
-
-  const joinRoom = async () => {
-    if (!roomId) {
-      setStatus("Please enter a Room ID.");
-      return;
-    }
-    setStatus("Requesting microphone...");
-    addLog("Requesting microphone...");
-    const localStream = await navigator.mediaDevices.getUserMedia({ audio: true });
-    localAudioRef.current.srcObject = localStream;
-    localStreamRef.current = localStream;
-    addLog("Microphone stream acquired.");
-
-    setStatus("Connecting to signaling server...");
-    addLog("Connecting to signaling server...");
-    const socket = io(SIGNALING_SERVER_URL, { transports: ["websocket"] });
-    socketRef.current = socket;
-    addLog("Socket.io client created.");
-
-    socket.on("connect", () => {
-      setStatus("Connected to signaling server. Joining room...");
-      addLog("Connected to signaling server. Joining room " + roomId);
-      socket.emit("join-room", { roomId, name });
-    });
-
-    socket.on("all-users", (users) => {
-      addLog(`Received all-users: ${JSON.stringify(users)}`);
-      if (users.length > 0) {
-        // Support both array of IDs and array of {id, name}
-        let userObj = users[0];
-        let id, remoteUserName;
-        if (typeof userObj === "string") {
-          id = userObj;
-          remoteUserName = "Remote User";
-          addLog(`Other user in room (legacy): ${id} (Remote User)`);
-        } else if (userObj && typeof userObj === "object") {
-          id = userObj.id;
-          remoteUserName = userObj.name || "Remote User";
-          addLog(`Other user in room: ${id} (${remoteUserName})`);
-        }
-        setOtherUserId(id);
-        setRemoteName(remoteUserName);
-      }
-    });
-
-    socket.on("offer", async ({ offer, from, name: remoteUserName }) => {
-      setOtherUserId(from);
-      setRemoteName(remoteUserName || "Remote User");
-      setStatus("Received offer. Creating answer...");
-      addLog(`Received offer from ${from} (${remoteUserName})`);
-      const pc = createPeerConnection(socket, localStream);
-      try {
-        await pc.setRemoteDescription(new RTCSessionDescription(offer));
-        addLog("Remote description set (offer)");
-      } catch (err) {
-        addLog("Error setting remote description (offer): " + err.message);
-      }
-      const answer = await pc.createAnswer();
-      await pc.setLocalDescription(answer);
-      addLog("Created and set local answer");
-      socket.emit("answer", { answer, to: from });
-      addLog("Sent answer to " + from);
-      setStatus("Sent answer. Waiting for audio...");
-    });
-
-    socket.on("answer", async ({ answer, from }) => {
-      setStatus("Received answer. Waiting for audio...");
-      addLog(`Received answer from ${from}`);
-      if (pcRef.current.signalingState === "have-local-offer") {
-        try {
-          await pcRef.current.setRemoteDescription(new RTCSessionDescription(answer));
-          addLog("Remote description set (answer)");
-        } catch (err) {
-          addLog("Error setting remote description (answer): " + err.message);
-        }
-      } else {
-        addLog("Skipped setRemoteDescription: signalingState=" + pcRef.current.signalingState);
-      }
-    });
-
-    socket.on("ice-candidate", async ({ candidate, from }) => {
-      addLog(`Received ICE candidate from ${from}`);
-      try {
-        await pcRef.current.addIceCandidate(new RTCIceCandidate(candidate));
-        addLog("ICE candidate added");
-      } catch (err) {
-        addLog("Error adding received ICE candidate: " + err.message);
-      }
-    });
-
-    setJoined(true);
-    setStatus("Joined room. Waiting for peer...");
-    addLog("Joined room " + roomId);
-  };
-
-  function createPeerConnection(socket, localStream) {
-    const pc = new RTCPeerConnection({
-      iceServers: [{ urls: "stun:stun.l.google.com:19302" }],
-    });
-    pcRef.current = pc;
-
-    localStream.getTracks().forEach((track) => pc.addTrack(track, localStream));
-    addLog("Added local audio tracks to peer connection");
-
-    pc.onicecandidate = (event) => {
-      if (event.candidate && otherUserId) {
-        socket.emit("ice-candidate", { candidate: event.candidate, to: otherUserId });
-        addLog("Sent ICE candidate to " + otherUserId);
-      }
-    };
-
-    pc.ontrack = (event) => {
-      remoteAudioRef.current.srcObject = event.streams[0];
-      setStatus("Receiving audio from peer!");
-      addLog("Received remote audio track");
-    };
-
-    return pc;
+    console.log(msg)
+    setLog(prev => [...prev.slice(-30), msg])
   }
 
-  const startCall = async () => {
-    if (!otherUserId) {
-      setStatus("No peer to call. Wait for another user to join.");
-      addLog("No peer to call. Wait for another user to join.");
-      return;
-    }
-    setStatus("Starting call...");
-    addLog("Starting call to " + otherUserId);
-    const socket = socketRef.current;
-    const localStream = localStreamRef.current;
-    const pc = createPeerConnection(socket, localStream);
-    const offer = await pc.createOffer();
-    await pc.setLocalDescription(offer);
-    addLog("Created and set local offer");
-    socket.emit("offer", { offer, to: otherUserId, name });
-    addLog("Sent offer to " + otherUserId);
-    setCallStarted(true);
-    setStatus("Offer sent. Waiting for answer...");
-  };
+  /* ── CONSUME REMOTE AUDIO ── */
+  const consumeRemoteAudio = useCallback(async (producerSocketId) => {
+    const device = deviceRef.current
+    const recvTransport = recvTransportRef.current
 
-  const toggleMute = () => {
-    if (!localStreamRef.current) return;
-    const audioTracks = localStreamRef.current.getAudioTracks();
-    if (audioTracks.length === 0) return;
-    if (micMuted) {
-      audioTracks.forEach(track => (track.enabled = true));
-      setMicMuted(false);
-      addLog("Microphone unmuted");
-    } else {
-      audioTracks.forEach(track => (track.enabled = false));
-      setMicMuted(true);
-      addLog("Microphone muted");
+    if (!device || !recvTransport) {
+      addLog("Cannot consume — device or recv transport not ready")
+      return
     }
-  };
+
+    // Avoid duplicate consumers for same producer
+    if (consumersRef.current[producerSocketId]) {
+      addLog(`Already consuming producer from ${producerSocketId}`)
+      return
+    }
+
+    addLog(`Consuming audio from: ${producerSocketId}`)
+
+    const consumerParams = await new Promise(res =>
+      socket.emit(
+        "consume",
+        {
+          rtpCapabilities: device.rtpCapabilities,
+          producerSocketId
+        },
+        res
+      )
+    )
+
+    if (!consumerParams) {
+      addLog("No consumer params returned")
+      return
+    }
+
+    addLog(`Consumer params received: ${consumerParams.id}`)
+
+    const consumer = await recvTransport.consume(consumerParams)
+
+    consumersRef.current[producerSocketId] = consumer
+
+    const remoteStream = new MediaStream()
+    remoteStream.addTrack(consumer.track)
+    remoteAudioRef.current.srcObject = remoteStream
+
+    addLog("Remote audio stream attached")
+  }, [])
+
+  /* ── LISTEN FOR NEW PRODUCERS ── */
+  useEffect(() => {
+    socket.on("new-producer", ({ producerSocketId }) => {
+      addLog(`New producer detected: ${producerSocketId}`)
+      consumeRemoteAudio(producerSocketId)
+    })
+
+    socket.on("peer-disconnected", ({ socketId }) => {
+      addLog(`Peer disconnected: ${socketId}`)
+      if (consumersRef.current[socketId]) {
+        consumersRef.current[socketId].close()
+        delete consumersRef.current[socketId]
+      }
+      if (remoteAudioRef.current) {
+        remoteAudioRef.current.srcObject = null
+      }
+    })
+
+    return () => {
+      socket.off("new-producer")
+      socket.off("peer-disconnected")
+    }
+  }, [consumeRemoteAudio])
+
+  /* ── JOIN ROOM ── */
+  async function joinRoom() {
+    if (hasJoinedRef.current) return
+    hasJoinedRef.current = true
+
+    try {
+      setStatus("Requesting microphone...")
+      addLog("Requesting microphone")
+
+      const stream = await navigator.mediaDevices.getUserMedia({ audio: true })
+      localAudioRef.current.srcObject = stream
+      addLog("Microphone ready")
+
+      setStatus("Joining room...")
+      socket.emit("join-room", { roomId: "room1", name: "User" })
+
+      /* GET RTP CAPABILITIES */
+      setStatus("Loading device...")
+      const routerRtpCapabilities = await new Promise(res =>
+        socket.emit("getRtpCapabilities", res)
+      )
+      addLog("RTP Capabilities received")
+
+      const device = new Device()
+      await device.load({ routerRtpCapabilities })
+      deviceRef.current = device
+      addLog("Device loaded")
+
+      /* CREATE SEND TRANSPORT */
+      setStatus("Creating send transport...")
+      const sendParams = await new Promise(res =>
+        socket.emit("createTransport", { direction: "send" }, res)
+      )
+      addLog(`Send transport params received: ${sendParams.id}`)
+
+      const sendTransport = device.createSendTransport(sendParams)
+
+      sendTransport.on("connect", ({ dtlsParameters }, cb) => {
+        addLog("Connecting send transport")
+        socket.emit("connectTransport", {
+          transportId: sendTransport.id,
+          dtlsParameters
+        })
+        cb()
+      })
+
+      sendTransport.on("produce", ({ kind, rtpParameters }, cb) => {
+        addLog("Producing audio")
+        socket.emit(
+          "produce",
+          { transportId: sendTransport.id, kind, rtpParameters },
+          ({ id }) => {
+            addLog(`Producer created: ${id}`)
+            cb({ id })
+          }
+        )
+      })
+
+      sendTransportRef.current = sendTransport
+
+      await sendTransport.produce({
+        track: stream.getAudioTracks()[0]
+      })
+      addLog("Audio sending started")
+
+      /* CREATE RECEIVE TRANSPORT */
+      setStatus("Creating receive transport...")
+      const recvParams = await new Promise(res =>
+        socket.emit("createTransport", { direction: "recv" }, res)
+      )
+      addLog(`Recv transport params received: ${recvParams.id}`)
+
+      const recvTransport = device.createRecvTransport(recvParams)
+
+      recvTransport.on("connect", ({ dtlsParameters }, cb) => {
+        addLog("Connecting recv transport")
+        socket.emit("connectTransport", {
+          transportId: recvTransport.id,
+          dtlsParameters
+        })
+        cb()
+      })
+
+      recvTransportRef.current = recvTransport
+
+      /* CONSUME ANY EXISTING PRODUCERS IN THE ROOM */
+      setStatus("Checking for existing peers...")
+      const existingProducers = await new Promise(res =>
+        socket.emit("getExistingProducers", res)
+      )
+
+      if (existingProducers && existingProducers.length > 0) {
+        addLog(`Found ${existingProducers.length} existing producer(s)`)
+        for (const { producerSocketId } of existingProducers) {
+          await consumeRemoteAudio(producerSocketId)
+        }
+      } else {
+        addLog("No existing producers — waiting for peers to join")
+      }
+
+      setStatus("connected")
+      setJoined(true)
+
+    } catch (err) {
+      addLog(`Error: ${err.message}`)
+      setStatus("error")
+      hasJoinedRef.current = false
+    }
+  }
+
+  /* ── MIC TOGGLE ── */
+  function toggleMic() {
+    const stream = localAudioRef.current?.srcObject
+    if (!stream) return
+    const track = stream.getAudioTracks()[0]
+    track.enabled = !track.enabled
+    setMicOn(track.enabled)
+    addLog(`Mic ${track.enabled ? "enabled" : "muted"}`)
+  }
+
+  const statusColor = {
+    idle: "#666",
+    connected: "#22c55e",
+    error: "#ef4444"
+  }[status] || "#f59e0b"
 
   return (
-    <div style={{ padding: 24 }}>
-      <h2>Minimal WebRTC Voice Call (P2P)</h2>
-      <div style={{ marginBottom: 16 }}>
-        <label>
-          Name:
-          <input
-            value={name}
-            onChange={e => setName(e.target.value)}
-            disabled={joined}
-            style={{ marginLeft: 8, marginRight: 16 }}
-          />
-        </label>
-        <label>
-          Room ID:
-          <input
-            value={roomId}
-            onChange={e => setRoomId(e.target.value)}
-            disabled={joined}
-            style={{ marginLeft: 8 }}
-          />
-        </label>
-        <button onClick={joinRoom} disabled={joined || !roomId || !name} style={{ marginLeft: 12 }}>
-          Join Room
-        </button>
-        <button onClick={startCall} disabled={!joined || callStarted || !otherUserId} style={{ marginLeft: 12 }}>
-          Start Call
-        </button>
-        <button onClick={toggleMute} disabled={!joined} style={{ marginLeft: 12 }}>
-          {micMuted ? "Unmute Mic" : "Mute Mic"}
-        </button>
+    <div style={{
+      minHeight: "100vh",
+      background: "#0a0a0f",
+      color: "#e8e6df",
+      fontFamily: "'DM Mono', 'Courier New', monospace",
+      padding: "0"
+    }}>
+      {/* Header */}
+      <div style={{
+        borderBottom: "1px solid #1e1e2e",
+        padding: "20px 32px",
+        display: "flex",
+        alignItems: "center",
+        gap: "12px",
+        background: "#0d0d14"
+      }}>
+        <div style={{
+          width: 10, height: 10,
+          borderRadius: "50%",
+          background: statusColor,
+          boxShadow: `0 0 8px ${statusColor}`,
+          flexShrink: 0
+        }}/>
+        <span style={{ fontSize: 13, letterSpacing: "0.15em", color: "#888", textTransform: "uppercase" }}>
+          VOICE CALL
+        </span>
+        <span style={{ marginLeft: "auto", fontSize: 12, color: "#555", letterSpacing: "0.1em" }}>
+          {status === "connected" ? "● LIVE" : status.toUpperCase()}
+        </span>
       </div>
-      <div style={{ marginTop: 24 }}>
-        <div>Status: {status}</div>
-        {remoteName && (
-          <div style={{ marginTop: 8 }}>
-            <b>Remote User:</b> {remoteName}
+
+      <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 0, minHeight: "calc(100vh - 61px)" }}>
+
+        {/* Left panel — controls */}
+        <div style={{
+          borderRight: "1px solid #1e1e2e",
+          padding: "40px 32px",
+          display: "flex",
+          flexDirection: "column",
+          gap: "32px"
+        }}>
+
+          {/* Join button */}
+          {!joined && (
+            <button
+              onClick={joinRoom}
+              style={{
+                background: "transparent",
+                border: "1px solid #4ade80",
+                color: "#4ade80",
+                padding: "14px 28px",
+                fontSize: 13,
+                letterSpacing: "0.12em",
+                textTransform: "uppercase",
+                cursor: "pointer",
+                borderRadius: 4,
+                transition: "all 0.2s",
+                fontFamily: "inherit"
+              }}
+              onMouseEnter={e => {
+                e.target.style.background = "#4ade80"
+                e.target.style.color = "#0a0a0f"
+              }}
+              onMouseLeave={e => {
+                e.target.style.background = "transparent"
+                e.target.style.color = "#4ade80"
+              }}
+            >
+              Join Room
+            </button>
+          )}
+
+          {/* Mic toggle */}
+          {joined && (
+            <button
+              onClick={toggleMic}
+              style={{
+                background: "transparent",
+                border: `1px solid ${micOn ? "#f59e0b" : "#ef4444"}`,
+                color: micOn ? "#f59e0b" : "#ef4444",
+                padding: "14px 28px",
+                fontSize: 13,
+                letterSpacing: "0.12em",
+                textTransform: "uppercase",
+                cursor: "pointer",
+                borderRadius: 4,
+                transition: "all 0.2s",
+                fontFamily: "inherit"
+              }}
+            >
+              {micOn ? "⬤ MIC ON — CLICK TO MUTE" : "○ MIC OFF — CLICK TO UNMUTE"}
+            </button>
+          )}
+
+          {/* Audio elements */}
+          <div style={{ display: "flex", flexDirection: "column", gap: "20px" }}>
+            <div>
+              <div style={{ fontSize: 11, letterSpacing: "0.15em", color: "#555", marginBottom: 8, textTransform: "uppercase" }}>
+                Local Audio (your mic)
+              </div>
+              <audio
+                ref={localAudioRef}
+                autoPlay
+                muted
+                controls
+                style={{ width: "100%", filter: "invert(1) hue-rotate(180deg)", opacity: 0.7 }}
+              />
+            </div>
+
+            <div>
+              <div style={{ fontSize: 11, letterSpacing: "0.15em", color: "#555", marginBottom: 8, textTransform: "uppercase" }}>
+                Remote Audio (peer)
+              </div>
+              <audio
+                ref={remoteAudioRef}
+                autoPlay
+                controls
+                style={{ width: "100%", filter: "invert(1) hue-rotate(180deg)", opacity: 0.7 }}
+              />
+            </div>
           </div>
-        )}
-        <div style={{ marginTop: 16 }}>
-          <b>Local Audio:</b>
-          <audio ref={localAudioRef} autoPlay muted controls style={{ width: 300 }} />
         </div>
-        <div style={{ marginTop: 16 }}>
-          <b>Remote Audio:</b>
-          <audio ref={remoteAudioRef} autoPlay controls style={{ width: 300 }} />
-        </div>
-        <div style={{ marginTop: 16, maxHeight: 200, overflowY: 'auto', background: '#f7f7f7', padding: 8, borderRadius: 4 }}>
-          <b>Logs:</b>
-          <ul style={{ fontSize: 13, margin: 0, paddingLeft: 16 }}>
-            {logs.map((log, idx) => (
-              <li key={idx}>{log}</li>
+
+        {/* Right panel — logs */}
+        <div style={{ padding: "40px 32px", display: "flex", flexDirection: "column" }}>
+          <div style={{
+            fontSize: 11,
+            letterSpacing: "0.15em",
+            color: "#555",
+            marginBottom: 16,
+            textTransform: "uppercase"
+          }}>
+            Event Log
+          </div>
+          <div style={{
+            flex: 1,
+            background: "#0d0d14",
+            border: "1px solid #1e1e2e",
+            borderRadius: 4,
+            padding: "16px",
+            overflow: "auto",
+            maxHeight: "calc(100vh - 180px)"
+          }}>
+            {log.length === 0 && (
+              <div style={{ color: "#333", fontSize: 12 }}>Waiting for events...</div>
+            )}
+            {log.map((entry, i) => (
+              <div key={i} style={{
+                fontSize: 12,
+                color: entry.startsWith("Error") ? "#ef4444" : "#6ee7b7",
+                padding: "3px 0",
+                borderBottom: "1px solid #111",
+                fontFamily: "inherit"
+              }}>
+                <span style={{ color: "#444", marginRight: 8 }}>
+                  {String(i + 1).padStart(2, "0")}
+                </span>
+                {entry}
+              </div>
             ))}
-          </ul>
+          </div>
         </div>
+
       </div>
     </div>
-  );
+  )
 }
-
-export default App;
