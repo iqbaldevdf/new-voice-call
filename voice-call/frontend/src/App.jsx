@@ -54,9 +54,20 @@ function App() {
     socket.on("all-users", (users) => {
       addLog(`Received all-users: ${JSON.stringify(users)}`);
       if (users.length > 0) {
-        setOtherUserId(users[0].id);
-        setRemoteName(users[0].name || "Remote User");
-        addLog(`Other user in room: ${users[0].id} (${users[0].name})`);
+        // Support both array of IDs and array of {id, name}
+        let userObj = users[0];
+        let id, remoteUserName;
+        if (typeof userObj === "string") {
+          id = userObj;
+          remoteUserName = "Remote User";
+          addLog(`Other user in room (legacy): ${id} (Remote User)`);
+        } else if (userObj && typeof userObj === "object") {
+          id = userObj.id;
+          remoteUserName = userObj.name || "Remote User";
+          addLog(`Other user in room: ${id} (${remoteUserName})`);
+        }
+        setOtherUserId(id);
+        setRemoteName(remoteUserName);
       }
     });
 
