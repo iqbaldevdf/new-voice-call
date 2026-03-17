@@ -2,7 +2,7 @@ import React, { useRef, useState, useEffect, useCallback } from "react"
 import io from "socket.io-client"
 import { Device } from "mediasoup-client"
 
-const socket = io("http://localhost:3002")
+const socket = io("https://gk7x1xxc-3002.inc1.devtunnels.ms")
 
 export default function App() {
   const localAudioRef = useRef(null)
