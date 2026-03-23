@@ -1,133 +1,132 @@
 require('dotenv').config();
 const express = require('express');
-const http = require('http');
-const cors = require('cors'); // ✅ make sure: npm install cors
+const http    = require('http');
+const cors    = require('cors');
 const { Server } = require('socket.io');
-const app = express();
+
+const app    = express();
 const server = http.createServer(app);
 
-// ✅ CORS FIX — must be BEFORE all route definitions
-// Previously CORS was only on Socket.IO, not on Express HTTP routes.
-// The /assemblyai-token route is a plain HTTP POST, so it needs this.
+// ── CORS ──────────────────────────────────────────────────────────────────────
 const corsOriginFn = (origin, cb) => {
   if (!origin) return cb(null, true);
   const ok =
     /^https?:\/\/localhost(:\d+)?$/.test(origin) ||
-    /\.devtunnels\.ms$/.test(origin) ||
-    /\.ngrok-free\.dev$/.test(origin) ||
+    /\.devtunnels\.ms$/.test(origin)             ||
+    /\.ngrok-free\.dev$/.test(origin)            ||
     /\.ngrok\.io$/.test(origin);
   cb(null, ok);
 };
 const corsOptions = {
-  origin: corsOriginFn,
-  methods: ['GET', 'POST', 'OPTIONS'],
-  credentials: true,
+  origin:         corsOriginFn,
+  methods:        ['GET', 'POST', 'OPTIONS'],
+  credentials:    true,
   allowedHeaders: ['Content-Type', 'ngrok-skip-browser-warning'],
 };
-app.use(cors(corsOptions));          // ← applies to ALL express routes
+app.use(cors(corsOptions));
 app.use(express.json());
 
 // ── ENV ───────────────────────────────────────────────────────────────────────
 const ELEVENLABS_API_KEY  = process.env.ELEVENLABS_API_KEY;
 const ELEVENLABS_VOICE_ID = process.env.ELEVENLABS_VOICE_ID || 'pNInz6obpgDQGcFmaJgB';
-const ASSEMBLYAI_API_KEY  = process.env.ASSEMBLYAI_API_KEY || '';
+const ASSEMBLYAI_API_KEY  = process.env.ASSEMBLYAI_API_KEY  || '';
 
-// ── textToSpeech — unchanged ──────────────────────────────────────────────────
+// ── MyMemory langpair map ─────────────────────────────────────────────────────
+// Maps ISO targetLang code → MyMemory langpair string (always from English).
+// Add more entries here to support additional languages.
+const LANGPAIR_MAP = {
+  hi: 'en|hi',  // Hindi
+  ta: 'en|ta',  // Tamil
+  te: 'en|te',  // Telugu
+  fr: 'en|fr',  // French
+  de: 'en|de',  // German
+  es: 'en|es',  // Spanish
+  ar: 'en|ar',  // Arabic
+  zh: 'en|zh',  // Chinese
+  ja: 'en|ja',  // Japanese
+  ko: 'en|ko',  // Korean
+};
+
+// ── In-memory stores ──────────────────────────────────────────────────────────
+const rooms     = {};  // { roomId: [socketId, ...] }
+const userNames = {};  // { socketId: name }
+const userLangs = {};  // { socketId: "en"|"hi"|"ta"|... }
+//                       ↑ Each user's RECEIVER language preference.
+//                         Set at join-room. Used to route translate+TTS
+//                         individually per receiver when a transcript arrives.
+
+// ── textToSpeech ──────────────────────────────────────────────────────────────
 async function textToSpeech(text) {
-  try {
-    if (!text || typeof text !== 'string') {
-      console.log('[TTS] Skip: no text');
-      return null;
-    }
-    const trimmed = text.trim();
-    if (!trimmed) {
-      console.log('[TTS] Skip: empty text');
-      return null;
-    }
-    if (!ELEVENLABS_API_KEY) {
-      console.log('[TTS] Skip: ELEVENLABS_API_KEY not set');
-      return null;
-    }
-    if (!ELEVENLABS_VOICE_ID) {
-      console.log('[TTS] Skip: ELEVENLABS_VOICE_ID not set');
-      return null;
-    }
-    if (trimmed.length > 2500) {
-      console.log('[TTS] Trimming text to 2500 chars, was', trimmed.length);
-    }
+  if (!text?.trim())        { console.log('[TTS] Skip: empty');    return null; }
+  if (!ELEVENLABS_API_KEY)  { console.log('[TTS] Skip: no key');   return null; }
+  if (!ELEVENLABS_VOICE_ID) { console.log('[TTS] Skip: no voice'); return null; }
 
-    const bodyText = trimmed.slice(0, 2500);
-    const url = `https://api.elevenlabs.io/v1/text-to-speech/${ELEVENLABS_VOICE_ID}?output_format=mp3_44100_128`;
+  const bodyText = text.trim().slice(0, 2500);
+  const url      = `https://api.elevenlabs.io/v1/text-to-speech/${ELEVENLABS_VOICE_ID}?output_format=mp3_44100_128`;
 
-    console.log('[TTS] Requesting:', {
-      url,
-      textLength: bodyText.length,
-      preview: bodyText.slice(0, 50) + (bodyText.length > 50 ? '...' : '')
-    });
+  console.log('[TTS] Requesting:', bodyText.slice(0, 60) + (bodyText.length > 60 ? '...' : ''));
 
-    const res = await fetch(url, {
-      method: 'POST',
-      headers: {
-        'xi-api-key': ELEVENLABS_API_KEY,
-        'Content-Type': 'application/json',
-        'Accept': 'audio/mpeg',
+  const res = await fetch(url, {
+    method:  'POST',
+    headers: {
+      'xi-api-key':   ELEVENLABS_API_KEY,
+      'Content-Type': 'application/json',
+      'Accept':       'audio/mpeg',
+    },
+    body: JSON.stringify({
+      text:     bodyText,
+      model_id: 'eleven_multilingual_v2',
+      voice_settings: {
+        stability: 0.5, similarity_boost: 0.75,
+        style: 0.3, use_speaker_boost: true,
       },
-      body: JSON.stringify({
-        text: bodyText,
-        model_id: 'eleven_multilingual_v2',
-        voice_settings: {
-          stability: 0.5,
-          similarity_boost: 0.75,
-          style: 0.3,
-          use_speaker_boost: true
-        }
-      }),
-      signal: AbortSignal.timeout(15000),
-    });
+    }),
+    signal: AbortSignal.timeout(15000),
+  });
 
-    console.log('[TTS] Response status:', res.status, res.statusText);
+  if (!res.ok) {
+    const err = await res.text();
+    console.error('[TTS] Error:', res.status, err.slice(0, 200));
+    throw new Error(`ElevenLabs ${res.status}: ${err.slice(0, 100)}`);
+  }
 
-    if (!res.ok) {
-      const errBody = await res.text();
-      console.error('[TTS] Error body:', errBody.slice(0, 300));
-      throw new Error(`ElevenLabs ${res.status}: ${errBody.slice(0, 100)}`);
-    }
+  const buf = await res.arrayBuffer();
+  if (buf.byteLength === 0) { console.error('[TTS] Empty buffer'); return null; }
+  console.log('[TTS] Done, bytes:', buf.byteLength);
+  return Buffer.from(buf).toString('base64');
+}
 
-    const buf = await res.arrayBuffer();
-    const byteLength = buf.byteLength;
-    console.log('[TTS] Audio received, bytes:', byteLength);
-
-    if (byteLength === 0) {
-      console.error('[TTS] Empty audio buffer');
-      return null;
-    }
-
-    const base64 = Buffer.from(buf).toString('base64');
-    console.log('[TTS] Base64 length:', base64.length);
-    return base64;
-
-  } catch (err) {
-    console.error('[TTS] Error:', err.message || err);
-    throw err;
+// ── translate ─────────────────────────────────────────────────────────────────
+// Translates English text into the target language using MyMemory API.
+// Returns translated string, or original text if translation fails.
+async function translate(text, langpair) {
+  try {
+    const url = `https://api.mymemory.translated.net/get` +
+                `?q=${encodeURIComponent(text)}&langpair=${langpair}`;
+    const res  = await fetch(url, { signal: AbortSignal.timeout(5000) });
+    if (!res.ok) throw new Error(`MyMemory ${res.status}`);
+    const data       = await res.json();
+    const translated = data?.responseData?.translatedText;
+    return (typeof translated === 'string' && translated.trim())
+      ? translated.trim()
+      : text; // fallback to original if translation empty
+  } catch (e) {
+    console.error('[translate] Failed:', e.message, '— using original');
+    return text; // fallback to original on error
   }
 }
 
-// ── GET /api/translate — unchanged ────────────────────────────────────────────
+// ── GET /api/translate ────────────────────────────────────────────────────────
 app.get('/api/translate', async (req, res) => {
-  const text = (req.query.text || req.query.q || 'Hello').trim();
-  if (!text) {
-    return res.status(400).json({ ok: false, error: 'Missing query: text or q' });
-  }
+  const text     = (req.query.text || req.query.q || '').trim();
+  const lang     = (req.query.lang || 'hi').trim();
+  const langpair = LANGPAIR_MAP[lang] || 'en|hi';
+  if (!text) return res.status(400).json({ ok: false, error: 'Missing text' });
   try {
-    const url = `https://api.mymemory.translated.net/get?q=${encodeURIComponent(text)}&langpair=en|hi`;
-    const fetchRes = await fetch(url, { signal: AbortSignal.timeout(5000) });
-    if (!fetchRes.ok) throw new Error(`MyMemory API returned ${fetchRes.status}`);
-    const data = await fetchRes.json();
-    const translated = data?.responseData?.translatedText;
-    const result = (typeof translated === 'string' && translated.trim()) ? translated.trim() : null;
-    return res.json({ ok: true, original: text, translated: result, from: 'en', to: 'hi' });
-  } catch (err) {
-    return res.status(502).json({ ok: false, error: err.message || 'Translation failed', original: text });
+    const translated = await translate(text, langpair);
+    return res.json({ ok: true, original: text, translated, from: 'en', to: lang });
+  } catch (e) {
+    return res.status(502).json({ ok: false, error: e.message, original: text });
   }
 });
 
@@ -135,25 +134,20 @@ app.get('/api/translate', async (req, res) => {
 app.post('/assemblyai-token', async (req, res) => {
   if (!ASSEMBLYAI_API_KEY) {
     console.error('[AAI Token] ASSEMBLYAI_API_KEY not set');
-    return res.status(500).json({ error: 'ASSEMBLYAI_API_KEY not configured on server' });
+    return res.status(500).json({ error: 'ASSEMBLYAI_API_KEY not configured' });
   }
   try {
     const response = await fetch(
       'https://streaming.assemblyai.com/v3/token?expires_in_seconds=300',
-      {
-        method: 'GET',
-        headers: { Authorization: ASSEMBLYAI_API_KEY },
-      }
+      { method: 'GET', headers: { Authorization: ASSEMBLYAI_API_KEY } }
     );
-
     if (!response.ok) {
       const err = await response.text();
-      console.error('[AAI Token] AssemblyAI error:', err);
+      console.error('[AAI Token] Error:', err);
       return res.status(500).json({ error: 'AssemblyAI token request failed' });
     }
-
     const data = await response.json();
-    console.log('[AAI Token] Token issued successfully');
+    console.log('[AAI Token] Issued successfully');
     return res.json({ token: data.token });
   } catch (err) {
     console.error('[AAI Token] Exception:', err.message);
@@ -161,126 +155,165 @@ app.post('/assemblyai-token', async (req, res) => {
   }
 });
 
-// ── Socket.IO — same CORS origins ─────────────────────────────────────────────
+// ── Socket.IO ─────────────────────────────────────────────────────────────────
 const io = new Server(server, {
   cors: {
-    origin: corsOriginFn,
-    methods: ['GET', 'POST', 'OPTIONS'],
-    credentials: true,
+    origin:         corsOriginFn,
+    methods:        ['GET', 'POST', 'OPTIONS'],
+    credentials:    true,
     allowedHeaders: ['Content-Type', 'ngrok-skip-browser-warning'],
   },
 });
 
-const rooms = {};
-const userNames = {};
-
 io.on('connection', (socket) => {
   console.log('[Socket.io] Connected:', socket.id);
 
-  socket.on('join-room', ({ roomId, name }) => {
-    console.log(`[Signaling] ${socket.id} joining room: ${roomId} as ${name}`);
+  // ── join-room ─────────────────────────────────────────────────────────────
+  // Stores each user's targetLang preference so the transcript handler
+  // knows what language to translate+TTS into for each receiver.
+  socket.on('join-room', ({ roomId, name, targetLang }) => {
+    const lang = targetLang || 'en';
+    console.log(`[Room] "${name}" (${socket.id}) joined "${roomId}" | hearing in: ${lang}`);
+
     socket.join(roomId);
     if (!rooms[roomId]) rooms[roomId] = [];
     rooms[roomId].push(socket.id);
+
     userNames[socket.id] = name;
-    socket.roomId = roomId;
+    userLangs[socket.id] = lang;  // ← stored receiver preference
+    socket.roomId   = roomId;
     socket.userName = name;
+
+    // Tell existing users someone joined
     socket.to(roomId).emit('user-joined', { id: socket.id, name });
-    socket.emit('all-users', rooms[roomId]
-      .filter(id => id !== socket.id)
-      .map(id => ({ id, name: userNames[id] }))
+
+    // Tell the joiner who else is already here
+    socket.emit('all-users',
+      rooms[roomId]
+        .filter(id => id !== socket.id)
+        .map(id => ({ id, name: userNames[id] }))
     );
-    console.log(`[Signaling] Room ${roomId} users:`, rooms[roomId].map(id => ({ id, name: userNames[id] })));
+
+    console.log(`[Room] "${roomId}" members:`,
+      rooms[roomId].map(id => `${userNames[id]}(${userLangs[id]})`).join(', ')
+    );
   });
 
-  socket.on('offer', ({ offer, to, name }) => {
-    console.log(`[Signaling] Offer from ${socket.id} (${userNames[socket.id]}) to ${to}`);
-    io.to(to).emit('offer', { offer, from: socket.id, name: name || userNames[socket.id] });
-  });
+  socket.on('offer',         ({ offer, to, name }) =>
+    io.to(to).emit('offer',         { offer, from: socket.id, name: name || userNames[socket.id] }));
+  socket.on('answer',        ({ answer, to }) =>
+    io.to(to).emit('answer',        { answer, from: socket.id }));
+  socket.on('ice-candidate', ({ candidate, to }) =>
+    io.to(to).emit('ice-candidate', { candidate, from: socket.id }));
 
-  socket.on('answer', ({ answer, to }) => {
-    console.log(`[Signaling] Answer from ${socket.id} to ${to}`);
-    io.to(to).emit('answer', { answer, from: socket.id });
-  });
-
-  socket.on('ice-candidate', ({ candidate, to }) => {
-    console.log(`[Signaling] ICE candidate from ${socket.id} to ${to}`);
-    io.to(to).emit('ice-candidate', { candidate, from: socket.id });
-  });
-
+  // ── transcript ────────────────────────────────────────────────────────────
+  // Called when a user's speech is transcribed (English text).
+  //
+  // RECEIVER-BASED ROUTING:
+  //   For each OTHER user in the room, look up their stored targetLang.
+  //   - targetLang = "en"  → send transcript only (no translate, no TTS)
+  //   - targetLang = other → translate English → their language, then TTS,
+  //                          emit transcript + tts-audio directly to their
+  //                          socket ID (not a broadcast to everyone)
+  //
+  // Each receiver gets their own personalised translation + audio.
   socket.on('transcript', async ({ roomId, text }) => {
-    if (!roomId || !text || typeof text !== 'string') return;
-    const trimmed = text.trim();
-    if (!trimmed) return;
+    if (!roomId || !text?.trim()) return;
 
+    const trimmed    = text.trim();
     const senderName = userNames[socket.id] || 'Unknown';
-    let toSend = trimmed;
-    let translationMs = 0;
 
-    const tTranslateStart = Date.now();
-    try {
-      const translateUrl = `https://api.mymemory.translated.net/get?q=${encodeURIComponent(trimmed)}&langpair=en|hi`;
-      const res = await fetch(translateUrl, { signal: AbortSignal.timeout(5000) });
-      if (res.ok) {
-        const data = await res.json();
-        const translated = data?.responseData?.translatedText;
-        if (typeof translated === 'string' && translated.trim()) toSend = translated.trim();
-      }
-    } catch (e) {
-      console.error('[transcript] Translation failed:', e.message);
+    console.log(`[transcript] "${senderName}" spoke: "${trimmed.slice(0, 80)}"`);
+
+    // Get all OTHER users in the room (not the speaker)
+    const receivers = (rooms[roomId] || []).filter(id => id !== socket.id);
+
+    if (receivers.length === 0) {
+      console.log('[transcript] No receivers in room — nothing to send');
+      return;
     }
-    translationMs = Date.now() - tTranslateStart;
-    console.log('[transcript] Translation took', translationMs, 'ms');
 
-    socket.to(roomId).emit('transcript', {
-      from: socket.id,
-      name: senderName,
-      text: toSend,
-      translationMs,
-    });
+    // Process each receiver independently and in parallel
+    await Promise.all(receivers.map(async (receiverId) => {
+      const receiverLang = userLangs[receiverId] || 'en';
+      const langpair     = LANGPAIR_MAP[receiverLang];
 
-    console.log('[transcript] TTS starting for text length:', toSend.length, 'room:', roomId);
-    const tTtsStart = Date.now();
-    let ttsMs = 0;
-    try {
-      const audioBase64 = await textToSpeech(toSend);
-      ttsMs = Date.now() - tTtsStart;
-      console.log('[transcript] TTS took', ttsMs, 'ms');
-      if (audioBase64) {
-        console.log('[transcript] TTS success, emitting tts-audio to room', roomId, 'base64 length:', audioBase64.length);
-        socket.to(roomId).emit('tts-audio', {
-          from: socket.id,
-          name: senderName,
-          audioBase64,
-          mimeType: 'audio/mpeg',
-          ttsMs,
+      console.log(`[transcript] → receiver "${userNames[receiverId]}" wants: ${receiverLang}`);
+
+      // ── BRANCH A: English — transcript only ───────────────────────────────
+      // Receiver wants English. No translation needed — just send the
+      // original transcript directly. Skip TTS entirely.
+      if (receiverLang === 'en' || !langpair) {
+        console.log(`[transcript] → ${userNames[receiverId]}: sending EN transcript only`);
+        io.to(receiverId).emit('transcript', {
+          from:          socket.id,
+          name:          senderName,
+          text:          trimmed,       // original English
+          translationMs: null,
         });
-      } else {
-        console.log('[transcript] TTS returned null, not emitting audio');
+        return; // no TTS for English receivers
       }
-    } catch (e) {
-      ttsMs = Date.now() - tTtsStart;
-      console.error('[transcript] TTS failed after', ttsMs, 'ms:', e.message, e.stack);
-    }
+
+      // ── BRANCH B: Other language — translate + TTS per receiver ───────────
+      // Step 1: Translate English → receiver's language
+      const tTranslate  = Date.now();
+      const translated  = await translate(trimmed, langpair);
+      const translationMs = Date.now() - tTranslate;
+
+      console.log(`[transcript] → ${userNames[receiverId]} (${receiverLang}): ` +
+                  `"${translated.slice(0, 60)}" (${translationMs}ms)`);
+
+      // Step 2: Send translated transcript to this receiver
+      io.to(receiverId).emit('transcript', {
+        from: socket.id,
+        name: senderName,
+        text: translated,    // already in receiver's language
+        translationMs,
+      });
+
+      // Step 3: Generate TTS audio in receiver's language and send it
+      const tTts = Date.now();
+      try {
+        const audioBase64 = await textToSpeech(translated);
+        const ttsMs       = Date.now() - tTts;
+        console.log(`[transcript] → ${userNames[receiverId]} TTS: ${ttsMs}ms`);
+
+        if (audioBase64) {
+          io.to(receiverId).emit('tts-audio', {
+            from:        socket.id,
+            name:        senderName,
+            audioBase64,
+            mimeType:    'audio/mpeg',
+            ttsMs,
+          });
+        }
+      } catch (e) {
+        console.error(`[transcript] → ${userNames[receiverId]} TTS failed:`, e.message);
+      }
+    }));
   });
 
+  // ── disconnect ────────────────────────────────────────────────────────────
   socket.on('disconnect', () => {
     const { roomId } = socket;
     if (roomId && rooms[roomId]) {
       rooms[roomId] = rooms[roomId].filter(id => id !== socket.id);
       socket.to(roomId).emit('user-left', socket.id);
       if (rooms[roomId].length === 0) delete rooms[roomId];
-      console.log(`[Signaling] ${socket.id} (${userNames[socket.id]}) left room: ${roomId}`);
+      console.log(`[Room] "${roomId}" — ${userNames[socket.id]} left`);
     }
     delete userNames[socket.id];
+    delete userLangs[socket.id]; // clean up receiver preference
     console.log('[Socket.io] Disconnected:', socket.id);
   });
 });
 
+// ── Start ─────────────────────────────────────────────────────────────────────
 const PORT = process.env.PORT || 3002;
 server.listen(PORT, () => {
-  console.log(`Signaling server listening on port ${PORT}`);
-  console.log(`  ElevenLabs key  : ${ELEVENLABS_API_KEY  ? '✅ set' : '❌ NOT SET'}`);
-  console.log(`  AssemblyAI key  : ${ASSEMBLYAI_API_KEY  ? '✅ set' : '❌ NOT SET'}`);
-  console.log(`  Voice ID        : ${ELEVENLABS_VOICE_ID}`);
+  console.log(`\nSignaling server on port ${PORT}`);
+  console.log(`  ElevenLabs key : ${ELEVENLABS_API_KEY  ? '✅ set' : '❌ NOT SET'}`);
+  console.log(`  AssemblyAI key : ${ASSEMBLYAI_API_KEY  ? '✅ set' : '❌ NOT SET'}`);
+  console.log(`  Voice ID       : ${ELEVENLABS_VOICE_ID}`);
+  console.log(`  Languages      : en (no-op), ${Object.keys(LANGPAIR_MAP).join(', ')}\n`);
 });
