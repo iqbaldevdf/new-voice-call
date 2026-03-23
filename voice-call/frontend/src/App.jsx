@@ -15,9 +15,6 @@ function getSignalingServerUrl() {
 
 const SIGNALING_SERVER_URL = getSignalingServerUrl();
 
-// ── Language options (receiver side) ─────────────────────────────────────────
-// "I want to HEAR speech translated into this language"
-// value "en" = no translation, transcript only
 const LANGUAGES = [
   { value: "en", label: "English (no translation)" },
   { value: "hi", label: "Hindi"   },
@@ -76,7 +73,7 @@ body{font-family:'Google Sans','Segoe UI',sans-serif;background:#202124;color:#e
   gap:8px;flex-shrink:0;user-select:none}
 .vb-panel-hdr .cnt{margin-left:auto;font-size:11px;color:#5f6368;font-weight:400}
 .vb-transcripts{flex:1;overflow-y:auto;padding:10px;display:flex;
-  flex-direction:column;gap:8px;min-height:0;max-height:340px;
+  flex-direction:column;gap:8px;min-height:0;max-height:260px;
   scrollbar-width:thin;scrollbar-color:#5f6368 transparent}
 .vb-transcripts::-webkit-scrollbar{width:4px}
 .vb-transcripts::-webkit-scrollbar-thumb{background:#5f6368;border-radius:2px}
@@ -90,7 +87,30 @@ body{font-family:'Google Sans','Segoe UI',sans-serif;background:#202124;color:#e
 .vb-bubble.them .vb-btext{background:#3c4043;color:#e8eaed;border-bottom-left-radius:4px}
 .vb-bmeta{font-size:10px;color:#5f6368;padding:0 4px}
 .vb-empty{text-align:center;color:#5f6368;font-size:12px;margin:auto;padding:20px;line-height:1.7}
-.vb-logs{max-height:120px;overflow-y:auto;padding:6px 12px;
+
+/* ── in-call language switcher panel ── */
+.vb-lang-panel{padding:10px 12px;border-top:1px solid #3c4043;
+  display:flex;align-items:center;gap:8px;flex-shrink:0}
+.vb-lang-panel-label{font-size:11px;color:#9aa0a6;white-space:nowrap;flex-shrink:0}
+.vb-lang-select{flex:1;background:#3c4043;border:1.5px solid #5f6368;border-radius:6px;
+  color:#e8eaed;font-family:inherit;font-size:12px;padding:6px 28px 6px 8px;
+  outline:none;cursor:pointer;transition:border-color .15s;
+  appearance:none;
+  background-image:url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='10' height='6' viewBox='0 0 10 6'%3E%3Cpath d='M1 1l4 4 4-4' stroke='%239aa0a6' stroke-width='1.5' fill='none' stroke-linecap='round'/%3E%3C/svg%3E");
+  background-repeat:no-repeat;background-position:right 8px center}
+.vb-lang-select:focus{border-color:#8ab4f8}
+.vb-lang-select option{background:#3c4043;color:#e8eaed}
+/* flash animation when language changes */
+@keyframes langFlash{0%{border-color:#34a853}100%{border-color:#5f6368}}
+.vb-lang-select.changed{animation:langFlash 1s ease-out forwards}
+/* toast notification */
+.vb-toast{position:fixed;bottom:90px;left:50%;transform:translateX(-50%);
+  background:#1e3a2f;color:#81c784;border:1px solid rgba(129,199,132,.3);
+  border-radius:20px;padding:6px 16px;font-size:12px;
+  opacity:0;transition:opacity .2s;pointer-events:none;white-space:nowrap;z-index:100}
+.vb-toast.show{opacity:1}
+
+.vb-logs{max-height:100px;overflow-y:auto;padding:6px 12px;
   scrollbar-width:thin;scrollbar-color:#5f6368 transparent}
 .vb-logs::-webkit-scrollbar{width:4px}
 .vb-logs::-webkit-scrollbar-thumb{background:#5f6368;border-radius:2px}
@@ -194,11 +214,21 @@ function App() {
   const [pendingMuteUI, setPendingMuteUI] = useState(false);
   const [micError, setMicError]           = useState("");
 
-  // ── Receiver language preference ──────────────────────────────────────────
-  // "I want to HEAR other people's speech translated into this language."
-  // Sent once with join-room. Server stores it and uses it when routing
-  // translated audio back to this specific user.
+  // ── Language preference (receiver side) ───────────────────────────────────
   const [targetLang, setTargetLang] = useState("en");
+
+  // ── NEW: toast state for mid-call lang change feedback ────────────────────
+  const [toast, setToast]           = useState("");
+  const [toastVisible, setToastVisible] = useState(false);
+  const toastTimerRef = useRef(null);
+
+  // ref so worklet handler + emit always has latest value
+  const targetLangRef = useRef("en");
+
+  // ── joinedRef: mirrors joined state but never stale inside callbacks ──────
+  // joined is a React state value — closures created before setJoined(true)
+  // still read joined as false. joinedRef is always current.
+  const joinedRef = useRef(false);
 
   const translationActive = targetLang !== "en";
   const targetLangLabel   = LANGUAGES.find(l => l.value === targetLang)?.label || targetLang;
@@ -216,6 +246,7 @@ function App() {
   const workletNodeRef   = useRef(null);
   const audioActiveRef   = useRef(false);
   const pendingMuteRef   = useRef(false);
+  const langSelectRef    = useRef(null); // for flash animation
 
   const ttsQueueRef          = useRef([]);
   const ttsPlayingRef        = useRef(false);
@@ -226,7 +257,45 @@ function App() {
   useEffect(()=>{ micMutedRef.current = micMuted; },[micMuted]);
   useEffect(()=>{ nameRef.current     = name;     },[name]);
 
-  // ── TTS queue (unchanged) ─────────────────────────────────────────────────
+  // ── showToast helper ──────────────────────────────────────────────────────
+  function showToast(msg) {
+    setToast(msg);
+    setToastVisible(true);
+    if (toastTimerRef.current) clearTimeout(toastTimerRef.current);
+    toastTimerRef.current = setTimeout(() => setToastVisible(false), 2500);
+  }
+
+  // ── handleLangChange — called both from lobby and in-call dropdown ─────────
+  // When in-call, also emits "update-lang" to the server immediately
+  // so the next transcript is translated in the new language.
+  function handleLangChange(newLang) {
+    setTargetLang(newLang);
+    targetLangRef.current = newLang;
+
+    // ── FIX: use socketRef.current (not .connected) ────────────────────────
+    // .connected is unreliable on ngrok/polling transport — it returns false
+    // during the gap between poll requests even though the socket is active.
+    // Checking socketRef.current alone is sufficient: if it's non-null the
+    // socket exists and Socket.IO will queue+send the emit on next poll cycle.
+    if (joinedRef.current && socketRef.current) {
+      socketRef.current.emit("update-lang", { targetLang: newLang });
+      addLog(`🌐 Language changed to "${newLang}" — update sent to server`);
+
+      // Flash the select border green to confirm
+      if (langSelectRef.current) {
+        langSelectRef.current.classList.remove("changed");
+        void langSelectRef.current.offsetWidth;
+        langSelectRef.current.classList.add("changed");
+      }
+
+      const label = LANGUAGES.find(l => l.value === newLang)?.label || newLang;
+      showToast(newLang === "en"
+        ? "Switched to transcript only (no translation)"
+        : `Now hearing in ${label}`);
+    }
+  }
+
+  // ── TTS queue ─────────────────────────────────────────────────────────────
   playNextFromQueueRef.current = function playNextFromQueue() {
     if (ttsPlayingRef.current || ttsQueueRef.current.length === 0) return;
     const item = ttsQueueRef.current.shift();
@@ -260,7 +329,7 @@ function App() {
   const addLog = (msg) =>
     setLogs((prev) => [...prev, `[${new Date().toLocaleTimeString()}] ${msg}`]);
 
-  // ── AssemblyAI (unchanged) ────────────────────────────────────────────────
+  // ── AssemblyAI ────────────────────────────────────────────────────────────
   async function startAssemblyAI(stream) {
     addLog("Fetching AssemblyAI token...");
     let token;
@@ -268,10 +337,9 @@ function App() {
       const res = await fetch(`${SIGNALING_SERVER_URL}/assemblyai-token`, { method: "POST" });
       if (!res.ok) throw new Error("HTTP " + res.status);
       ({ token } = await res.json());
-      addLog("AssemblyAI token received.");
     } catch (err) {
       addLog("Failed to get AAI token: " + err.message);
-      setStatus("Could not connect to AssemblyAI. Check server.");
+      setStatus("Could not connect to AssemblyAI.");
       return;
     }
 
@@ -280,7 +348,7 @@ function App() {
       `?sample_rate=16000&speech_model=universal-streaming-english&token=${token}`;
 
     const aaiWs = new WebSocket(wsUrl);
-    aaiSocketRef.current  = aaiWs;
+    aaiSocketRef.current   = aaiWs;
     callStartedRef.current = true;
 
     aaiWs.onopen = async () => {
@@ -289,7 +357,7 @@ function App() {
 
       const audioCtx = new AudioContext({ sampleRate: 16000 });
       audioCtxRef.current = audioCtx;
-      if (audioCtx.state === "suspended") { await audioCtx.resume(); }
+      if (audioCtx.state === "suspended") await audioCtx.resume();
 
       try {
         await audioCtx.audioWorklet.addModule("/audio-processor.js");
@@ -317,7 +385,7 @@ function App() {
 
         if (micMutedRef.current && !pendingMuteRef.current) return;
         if (micMutedRef.current && pendingMuteRef.current) {
-          if (hasAudio) { aaiWs.send(int16Buffer); addLog("🔁 Flushed last chunk before mute"); }
+          if (hasAudio) { aaiWs.send(int16Buffer); addLog("🔁 Flushed last chunk"); }
           return;
         }
 
@@ -341,20 +409,11 @@ function App() {
         setStatus("🎙 Listening...");
         audioActiveRef.current = false;
 
-        // Show own speech locally (always English — we are the speaker)
         setTranscripts((prev) => [...prev, {
           from: "me", name: nameRef.current, text, ts: Date.now()
         }]);
 
-        // ── Send transcript to server ─────────────────────────────────────
-        // NO targetLang here — server knows each receiver's preference
-        // from when they called join-room. Server will translate+TTS
-        // individually for each receiver based on their stored preference.
-        socketRef.current.emit("transcript", {
-          roomId: roomIdRef.current,
-          text,
-        });
-        addLog("Sent transcript to server: " + text);
+        socketRef.current.emit("transcript", { roomId: roomIdRef.current, text });
 
         if (pendingMuteRef.current) {
           pendingMuteRef.current = false;
@@ -399,12 +458,12 @@ function App() {
   // ── joinRoom ──────────────────────────────────────────────────────────────
   const joinRoom = async () => {
     if (!roomId || !name) { setStatus("Please enter name and room."); return; }
-    roomIdRef.current = roomId;
-    nameRef.current   = name;
+    roomIdRef.current    = roomId;
+    nameRef.current      = name;
+    targetLangRef.current = targetLang;
 
     setMicError("");
     setStatus("Requesting microphone...");
-    addLog("Requesting microphone...");
 
     let localStream;
     try {
@@ -412,9 +471,9 @@ function App() {
     } catch (err) {
       let msg = "Could not access microphone.";
       if (err.name === "NotAllowedError"    || err.name === "PermissionDeniedError")
-        msg = "Microphone access denied. Allow mic permission in your browser settings and try again.";
+        msg = "Microphone access denied. Allow permission in browser settings and try again.";
       else if (err.name === "NotFoundError" || err.name === "DevicesNotFoundError")
-        msg = "No microphone found. Connect a microphone and try again.";
+        msg = "No microphone found. Connect one and try again.";
       else if (err.name === "NotReadableError" || err.name === "TrackStartError")
         msg = "Microphone is in use by another app. Close it and try again.";
       else if (err.name === "OverconstrainedError")
@@ -423,15 +482,12 @@ function App() {
         msg = `Microphone error: ${err.message || err.name}`;
       setMicError(msg);
       setStatus("");
-      addLog("getUserMedia failed: " + err.name);
       return;
     }
 
     localAudioRef.current.srcObject = localStream;
     localStreamRef.current = localStream;
-    addLog("Microphone acquired.");
 
-    setStatus("Connecting...");
     const socketUrl  = SIGNALING_SERVER_URL.trim().replace(/\/+$/, "");
     const isNgrok    = socketUrl.includes("ngrok");
     const socketOpts = isNgrok
@@ -445,16 +501,25 @@ function App() {
     socket.on("connect", () => {
       addLog("Connected. Joining room " + roomIdRef.current);
       setStatus("Joined. Speak now — listening in real time.");
-
-      // ── Send targetLang ONCE with join-room ───────────────────────────────
-      // Server stores this as the receiver's language preference.
-      // When ANYONE in the room speaks, server will translate+TTS
-      // specifically for this user based on this preference.
+      // ── FIX Bug 3: re-read targetLangRef fresh at connect time ────────────
+      // targetLangRef was set before the async getUserMedia call.
+      // If the user changed the dropdown while waiting for mic permission,
+      // the ref could be stale. Read targetLang state directly here via
+      // the closure — it always has the latest value at call time.
+      const currentLang = targetLangRef.current;
       socket.emit("join-room", {
         roomId:     roomIdRef.current,
         name,
-        targetLang,   // ← "I want to HEAR translations in this language"
+        targetLang: currentLang,
       });
+      addLog(`Joined with targetLang="${currentLang}"`);
+    });
+
+    // ── FIX Bug 2: listen for server acknowledgement of lang update ────────
+    // Server emits "lang-updated" after processing "update-lang".
+    // Logging this confirms the server actually received and stored the change.
+    socket.on("lang-updated", ({ targetLang: confirmedLang }) => {
+      addLog(`✅ Server confirmed language update: "${confirmedLang}"`);
     });
 
     socket.on("connect_error", (err) => addLog("Socket error: " + (err.message || String(err))));
@@ -469,20 +534,16 @@ function App() {
     });
 
     socket.on("user-joined", ({ id, name: rn }) => {
-      addLog(`${rn || "Remote User"} joined.`);
       setOtherUserId(id);
       setRemoteName(rn || "Remote User");
+      addLog(`${rn || "Remote User"} joined.`);
     });
 
-    // Receive transcript — text is already in OUR preferred language
-    // (server translated it for us based on our targetLang)
     socket.on("transcript", ({ from, name: fn, text, translationMs }) => {
       if (!text) return;
       setTranscripts((prev) => [...prev, { from, name: fn, text, translationMs, ts: Date.now() }]);
-      addLog(`${fn}: ${text}${typeof translationMs === "number" ? ` (${translationMs}ms)` : ""}`);
     });
 
-    // Receive TTS audio — audio is already in OUR preferred language
     socket.on("tts-audio", ({ from, name: fn, audioBase64, mimeType, ttsMs }) => {
       if (!audioBase64) return;
       addLog(`Audio from ${fn} (${ttsMs || 0}ms)`);
@@ -490,6 +551,7 @@ function App() {
     });
 
     setJoined(true);
+    joinedRef.current = true;
     addLog("Auto-starting AssemblyAI STT...");
     await startAssemblyAI(localStream);
   };
@@ -516,7 +578,7 @@ function App() {
         setPendingMuteUI(true);
         setMicMuted(true);
         micMutedRef.current = true;
-        addLog("⏳ Mute deferred — flushing sentence...");
+        addLog("⏳ Mute deferred — flushing...");
       } else {
         tracks.forEach(t => (t.enabled = false));
         micMutedRef.current    = true;
@@ -527,7 +589,7 @@ function App() {
     }
   };
 
-  // ── endCall / leave ───────────────────────────────────────────────────────
+  // ── endCall ───────────────────────────────────────────────────────────────
   const endCall = () => {
     stopAssemblyAI();
     if (socketRef.current) { socketRef.current.disconnect(); socketRef.current = null; }
@@ -536,6 +598,7 @@ function App() {
       localStreamRef.current = null;
     }
     setJoined(false);
+    joinedRef.current = false;
     setOtherUserId(null);
     setRemoteName("");
     setTranscripts([]);
@@ -585,14 +648,10 @@ function App() {
                 onKeyDown={e => e.key==="Enter" && roomId && name && joinRoom()} />
             </div>
 
-            {/* ── Receiver language selector ── */}
             <div className="vb-field">
               <div className="vb-flabel">I want to hear others in</div>
-              <select
-                className="vb-fselect"
-                value={targetLang}
-                onChange={e => setTargetLang(e.target.value)}
-              >
+              <select className="vb-fselect" value={targetLang}
+                onChange={e => handleLangChange(e.target.value)}>
                 {LANGUAGES.map(l => (
                   <option key={l.value} value={l.value}>{l.label}</option>
                 ))}
@@ -624,11 +683,16 @@ function App() {
   /* ── IN-CALL ── */
   return (
     <div className="vb-root">
+
+      {/* toast notification for language change */}
+      <div className={`vb-toast ${toastVisible ? "show" : ""}`}>{toast}</div>
+
+      {/* top bar */}
       <div className="vb-topbar">
         <div style={{ display:"flex", alignItems:"center", gap:8 }}>
           <span className="vb-logo">Voice<b>Bridge</b></span>
           {translationActive
-            ? <span className="vb-lang-badge">Hearing EN → {targetLang.toUpperCase()}</span>
+            ? <span className="vb-lang-badge">EN → {targetLang.toUpperCase()}</span>
             : <span className="vb-notrans-badge">Transcript only</span>
           }
           {pendingMuteUI && (
@@ -646,8 +710,11 @@ function App() {
         </div>
       </div>
 
+      {/* main stage */}
       <div className="vb-stage">
         <div className={`vb-tiles ${otherUserId ? "duo" : "solo"}`}>
+
+          {/* local tile */}
           <div className={`vb-tile${isHearing && !micMuted ? " lit" : ""}`}>
             <div className="vb-avatar" style={{ background: avatarColor(name) }}>{initials(name)}</div>
             {isHearing && !micMuted && (
@@ -663,6 +730,7 @@ function App() {
             {micMuted && <div className="vb-tile-muted">🎙</div>}
           </div>
 
+          {/* remote tile */}
           {otherUserId ? (
             <div className="vb-tile">
               <div className="vb-avatar" style={{ background: avatarColor(remoteName) }}>{initials(remoteName)}</div>
@@ -678,6 +746,7 @@ function App() {
           )}
         </div>
 
+        {/* side panel */}
         <div className="vb-side">
           <div className="vb-panel" style={{ flex:1 }}>
             <div className="vb-panel-hdr">
@@ -706,8 +775,29 @@ function App() {
               )}
               <div ref={transcriptEndRef} />
             </div>
+
+            {/* ── IN-CALL LANGUAGE SWITCHER ────────────────────────────────
+                Live language change. Selecting a new language here emits
+                "update-lang" to the server so the NEXT transcript from any
+                peer is already translated in the new language.
+                No call restart needed. ── */}
+            <div className="vb-lang-panel">
+              <span className="vb-lang-panel-label">Hearing in</span>
+              <select
+                ref={langSelectRef}
+                className="vb-lang-select"
+                value={targetLang}
+                onChange={e => handleLangChange(e.target.value)}
+                title="Change translation language mid-call"
+              >
+                {LANGUAGES.map(l => (
+                  <option key={l.value} value={l.value}>{l.label}</option>
+                ))}
+              </select>
+            </div>
           </div>
 
+          {/* logs panel */}
           <div className="vb-panel">
             <div className="vb-panel-hdr" style={{ cursor:"pointer" }} onClick={() => setShowLogs(v => !v)}>
               🪵 Debug Logs <span className="cnt">{showLogs ? "▾" : "▸"}</span>
@@ -721,6 +811,7 @@ function App() {
         </div>
       </div>
 
+      {/* bottom bar */}
       <div className="vb-bottombar">
         <div className="vb-bl">
           <div style={{ fontSize:13, color:"#e8eaed", fontWeight:500 }}>{roomId}</div>
@@ -748,7 +839,7 @@ function App() {
           </div>
 
           <div className="cbtn-wrap">
-            <button className="cbtn grey" onClick={() => setShowLogs(v => !v)} title="Toggle logs">ℹ️</button>
+            <button className="cbtn grey" onClick={() => setShowLogs(v => !v)}>ℹ️</button>
             <span>Info</span>
           </div>
         </div>
