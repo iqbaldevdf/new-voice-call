@@ -9,14 +9,20 @@ const server = http.createServer(app);
 // ✅ CORS FIX — must be BEFORE all route definitions
 // Previously CORS was only on Socket.IO, not on Express HTTP routes.
 // The /assemblyai-token route is a plain HTTP POST, so it needs this.
+const corsOriginFn = (origin, cb) => {
+  if (!origin) return cb(null, true);
+  const ok =
+    /^https?:\/\/localhost(:\d+)?$/.test(origin) ||
+    /\.devtunnels\.ms$/.test(origin) ||
+    /\.ngrok-free\.dev$/.test(origin) ||
+    /\.ngrok\.io$/.test(origin);
+  cb(null, ok);
+};
 const corsOptions = {
-  origin: [
-    'http://localhost:5175',
-    'http://localhost:5174',
-    'https://unvaccinated-tempie-depreciatively.ngrok-free.dev'
-  ],
+  origin: corsOriginFn,
   methods: ['GET', 'POST', 'OPTIONS'],
   credentials: true,
+  allowedHeaders: ['Content-Type', 'ngrok-skip-browser-warning'],
 };
 app.use(cors(corsOptions));          // ← applies to ALL express routes
 app.use(express.json());
@@ -157,7 +163,12 @@ app.post('/assemblyai-token', async (req, res) => {
 
 // ── Socket.IO — same CORS origins ─────────────────────────────────────────────
 const io = new Server(server, {
-  cors: corsOptions, // ✅ reuse same options object — stays in sync
+  cors: {
+    origin: corsOriginFn,
+    methods: ['GET', 'POST', 'OPTIONS'],
+    credentials: true,
+    allowedHeaders: ['Content-Type', 'ngrok-skip-browser-warning'],
+  },
 });
 
 const rooms = {};
