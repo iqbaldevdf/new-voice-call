@@ -143,17 +143,11 @@ io.on('connection', (socket) => {
   });
 
   // ── update-lang — mid-call language change ────────────────────────────────
-  // Fired by the frontend when the user changes the language dropdown
-  // while already in a call. Updates userLangs[socket.id] immediately.
-  // The very next transcript from any peer will use the new language.
   socket.on('update-lang', ({ targetLang }) => {
     const newLang = targetLang || 'en';
     const oldLang = userLangs[socket.id] || 'en';
     userLangs[socket.id] = newLang;
-    console.log(
-      `[update-lang] "${userNames[socket.id]}" changed: ${oldLang} → ${newLang}`
-    );
-    // Acknowledge back to the client so it can confirm the update was received
+    console.log(`[update-lang] "${userNames[socket.id]}" changed: ${oldLang} → ${newLang}`);
     socket.emit('lang-updated', { targetLang: newLang });
   });
 
@@ -177,45 +171,49 @@ io.on('connection', (socket) => {
     console.log(`[transcript] receivers: ${receivers.map(id => `${userNames[id]}(${userLangs[id]})`).join(', ')}`);
 
     await Promise.all(receivers.map(async (receiverId) => {
-      // Read the CURRENT language for this receiver.
-      // If they changed it mid-call via update-lang, userLangs already
-      // reflects the new value — no extra logic needed here.
       const receiverLang = userLangs[receiverId] || 'en';
       const langpair     = LANGPAIR_MAP[receiverLang];
+      const tStart       = Date.now();
 
-      // ── English receiver: transcript only, no TTS ─────────────────────────
-      if (receiverLang === 'en' || !langpair) {
-        io.to(receiverId).emit('transcript', {
-          from: socket.id, name: senderName,
-          text: trimmed, translationMs: null,
-        });
-        return;
+      // ── Step 1: Translate if needed, otherwise use original text ──────────
+      // English receiver → no translation, deliver original text as-is.
+      // Other languages → translate first.
+      let deliveredText = trimmed;
+      let translationMs = null;
+
+      if (receiverLang !== 'en' && langpair) {
+        deliveredText = await translate(trimmed, langpair);
+        translationMs = Date.now() - tStart;
+        console.log(`[transcript] → "${userNames[receiverId]}" (${receiverLang}): ` +
+                    `"${deliveredText.slice(0, 60)}" (${translationMs}ms)`);
+      } else {
+        console.log(`[transcript] → "${userNames[receiverId]}" (en): no translation needed`);
       }
 
-      // ── Other language receiver: translate + TTS ──────────────────────────
-      const tStart     = Date.now();
-      const translated = await translate(trimmed, langpair);
-      const translationMs = Date.now() - tStart;
-
-      console.log(`[transcript] → "${userNames[receiverId]}" (${receiverLang}): ` +
-                  `"${translated.slice(0, 60)}" (${translationMs}ms)`);
-
+      // ── Step 2: Always send transcript text ───────────────────────────────
       io.to(receiverId).emit('transcript', {
         from: socket.id, name: senderName,
-        text: translated, translationMs,
+        text: deliveredText, translationMs,
       });
 
+      // ── Step 3: Always send TTS audio ─────────────────────────────────────
+      // FIX: Previously English receivers were skipped here with an early
+      // `return` — so they got transcript text but no voice audio.
+      // Now TTS runs for ALL receivers regardless of language. English
+      // receivers hear TTS of the original text; others hear TTS of the
+      // translated text. Both paths go through the same TTS call below.
       try {
-        const audioBase64 = await textToSpeech(translated);
-        const ttsMs       = Date.now() - tStart - translationMs;
+        const audioBase64 = await textToSpeech(deliveredText);
+        const ttsMs       = Date.now() - tStart - (translationMs || 0);
         if (audioBase64) {
           io.to(receiverId).emit('tts-audio', {
             from: socket.id, name: senderName,
             audioBase64, mimeType: 'audio/mpeg', ttsMs,
           });
+          console.log(`[tts] → "${userNames[receiverId]}" (${receiverLang}) sent in ${ttsMs}ms`);
         }
       } catch (e) {
-        console.error(`[transcript] TTS failed for "${userNames[receiverId]}":`, e.message);
+        console.error(`[tts] failed for "${userNames[receiverId]}":`, e.message);
       }
     }));
   });
@@ -242,5 +240,5 @@ server.listen(PORT, () => {
   console.log(`  ElevenLabs key : ${ELEVENLABS_API_KEY  ? '✅ set' : '❌ NOT SET'}`);
   console.log(`  AssemblyAI key : ${ASSEMBLYAI_API_KEY  ? '✅ set' : '❌ NOT SET'}`);
   console.log(`  Voice ID       : ${ELEVENLABS_VOICE_ID}`);
-  console.log(`  Languages      : en (no-op), ${Object.keys(LANGPAIR_MAP).join(', ')}\n`);
+  console.log(`  Languages      : en (TTS, no translation), ${Object.keys(LANGPAIR_MAP).join(', ')}\n`);
 });
