@@ -207,6 +207,7 @@ function App() {
   const [joined, setJoined]               = useState(false);
   const [status, setStatus]               = useState("");
   const [otherUserId, setOtherUserId]     = useState(null);
+  const otherUserIdRef                  = useRef(null);
   const [micMuted, setMicMuted]           = useState(false);
   const [logs, setLogs]                   = useState([]);
   const [transcripts, setTranscripts]     = useState([]);
@@ -256,6 +257,7 @@ function App() {
   useEffect(()=>{ transcriptEndRef.current?.scrollIntoView({behavior:"smooth"}); },[transcripts]);
   useEffect(()=>{ micMutedRef.current = micMuted; },[micMuted]);
   useEffect(()=>{ nameRef.current     = name;     },[name]);
+  useEffect(()=>{ otherUserIdRef.current = otherUserId; },[otherUserId]);
 
   // ── showToast helper ──────────────────────────────────────────────────────
   function showToast(msg) {
@@ -539,6 +541,16 @@ function App() {
       addLog(`${rn || "Remote User"} joined.`);
     });
 
+    socket.on("user-left", (leftUserId) => {
+      if (otherUserIdRef.current !== leftUserId) return;
+      setOtherUserId(null);
+      otherUserIdRef.current = null;
+      setRemoteName("");
+      ttsQueueRef.current = [];
+      ttsPlayingRef.current = false;
+      addLog("Peer left the call.");
+    });
+
     socket.on("transcript", ({ from, name: fn, text, translationMs }) => {
       if (!text) return;
       setTranscripts((prev) => [...prev, { from, name: fn, text, translationMs, ts: Date.now() }]);
@@ -600,6 +612,7 @@ function App() {
     setJoined(false);
     joinedRef.current = false;
     setOtherUserId(null);
+    otherUserIdRef.current = null;
     setRemoteName("");
     setTranscripts([]);
     setMicMuted(false);
