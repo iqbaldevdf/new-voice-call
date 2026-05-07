@@ -31,6 +31,10 @@ app.use(express.json());
 const ELEVENLABS_API_KEY  = process.env.ELEVENLABS_API_KEY;
 const ELEVENLABS_VOICE_ID = process.env.ELEVENLABS_VOICE_ID || 'pNInz6obpgDQGcFmaJgB';
 const ASSEMBLYAI_API_KEY  = process.env.ASSEMBLYAI_API_KEY || '';
+const LANGPAIR_MAP = {
+  hi: "en|hi",
+  ta: "en|ta",
+};
 
 // ── textToSpeech — unchanged ──────────────────────────────────────────────────
 async function textToSpeech(text) {
@@ -173,16 +177,19 @@ const io = new Server(server, {
 
 const rooms = {};
 const userNames = {};
+const userLangs = {};
 
 io.on('connection', (socket) => {
   console.log('[Socket.io] Connected:', socket.id);
 
-  socket.on('join-room', ({ roomId, name }) => {
-    console.log(`[Signaling] ${socket.id} joining room: ${roomId} as ${name}`);
+  socket.on('join-room', ({ roomId, name, targetLang }) => {
+    const hearingMode = targetLang || "original";
+    console.log(`[Signaling] ${socket.id} joining room: ${roomId} as ${name} hearing ${hearingMode}`);
     socket.join(roomId);
     if (!rooms[roomId]) rooms[roomId] = [];
     rooms[roomId].push(socket.id);
     userNames[socket.id] = name;
+    userLangs[socket.id] = hearingMode;
     socket.roomId = roomId;
     socket.userName = name;
     socket.to(roomId).emit('user-joined', { id: socket.id, name });
@@ -191,6 +198,13 @@ io.on('connection', (socket) => {
       .map(id => ({ id, name: userNames[id] }))
     );
     console.log(`[Signaling] Room ${roomId} users:`, rooms[roomId].map(id => ({ id, name: userNames[id] })));
+  });
+
+  socket.on("update-lang", ({ targetLang }) => {
+    const nextLang = targetLang || "original";
+    userLangs[socket.id] = nextLang;
+    socket.emit("lang-updated", { targetLang: nextLang });
+    console.log(`[Signaling] ${socket.id} hearing mode updated to ${nextLang}`);
   });
 
   socket.on('offer', ({ offer, to, name }) => {
@@ -214,54 +228,58 @@ io.on('connection', (socket) => {
     if (!trimmed) return;
 
     const senderName = userNames[socket.id] || 'Unknown';
-    let toSend = trimmed;
-    let translationMs = 0;
+    const receivers = (rooms[roomId] || []).filter((id) => id !== socket.id);
+    if (!receivers.length) return;
 
-    const tTranslateStart = Date.now();
-    try {
-      const translateUrl = `https://api.mymemory.translated.net/get?q=${encodeURIComponent(trimmed)}&langpair=en|hi`;
-      const res = await fetch(translateUrl, { signal: AbortSignal.timeout(5000) });
-      if (res.ok) {
-        const data = await res.json();
-        const translated = data?.responseData?.translatedText;
-        if (typeof translated === 'string' && translated.trim()) toSend = translated.trim();
+    await Promise.all(receivers.map(async (receiverId) => {
+      const receiverLang = userLangs[receiverId] || "original";
+      const langpair = LANGPAIR_MAP[receiverLang];
+      let toSend = trimmed;
+      let translationMs = null;
+
+      if (langpair) {
+        const tTranslateStart = Date.now();
+        try {
+          const translateUrl = `https://api.mymemory.translated.net/get?q=${encodeURIComponent(trimmed)}&langpair=${langpair}`;
+          const res = await fetch(translateUrl, { signal: AbortSignal.timeout(5000) });
+          if (res.ok) {
+            const data = await res.json();
+            const translated = data?.responseData?.translatedText;
+            if (typeof translated === "string" && translated.trim()) toSend = translated.trim();
+          }
+        } catch (e) {
+          console.error("[transcript] Translation failed:", e.message);
+        }
+        translationMs = Date.now() - tTranslateStart;
       }
-    } catch (e) {
-      console.error('[transcript] Translation failed:', e.message);
-    }
-    translationMs = Date.now() - tTranslateStart;
-    console.log('[transcript] Translation took', translationMs, 'ms');
 
-    socket.to(roomId).emit('transcript', {
-      from: socket.id,
-      name: senderName,
-      text: toSend,
-      translationMs,
-    });
+      io.to(receiverId).emit("transcript", {
+        from: socket.id,
+        name: senderName,
+        text: toSend,
+        translationMs,
+      });
 
-    console.log('[transcript] TTS starting for text length:', toSend.length, 'room:', roomId);
-    const tTtsStart = Date.now();
-    let ttsMs = 0;
-    try {
-      const audioBase64 = await textToSpeech(toSend);
-      ttsMs = Date.now() - tTtsStart;
-      console.log('[transcript] TTS took', ttsMs, 'ms');
-      if (audioBase64) {
-        console.log('[transcript] TTS success, emitting tts-audio to room', roomId, 'base64 length:', audioBase64.length);
-        socket.to(roomId).emit('tts-audio', {
-          from: socket.id,
-          name: senderName,
-          audioBase64,
-          mimeType: 'audio/mpeg',
-          ttsMs,
-        });
-      } else {
-        console.log('[transcript] TTS returned null, not emitting audio');
+      if (receiverLang === "en" || receiverLang === "original") return;
+
+      const tTtsStart = Date.now();
+      try {
+        const audioBase64 = await textToSpeech(toSend);
+        const ttsMs = Date.now() - tTtsStart;
+        if (audioBase64) {
+          io.to(receiverId).emit("tts-audio", {
+            from: socket.id,
+            name: senderName,
+            audioBase64,
+            mimeType: "audio/mpeg",
+            ttsMs,
+          });
+        }
+      } catch (e) {
+        const ttsMs = Date.now() - tTtsStart;
+        console.error("[transcript] TTS failed after", ttsMs, "ms:", e.message);
       }
-    } catch (e) {
-      ttsMs = Date.now() - tTtsStart;
-      console.error('[transcript] TTS failed after', ttsMs, 'ms:', e.message, e.stack);
-    }
+    }));
   });
 
   socket.on('disconnect', () => {
@@ -273,6 +291,7 @@ io.on('connection', (socket) => {
       console.log(`[Signaling] ${socket.id} (${userNames[socket.id]}) left room: ${roomId}`);
     }
     delete userNames[socket.id];
+    delete userLangs[socket.id];
     console.log('[Socket.io] Disconnected:', socket.id);
   });
 });

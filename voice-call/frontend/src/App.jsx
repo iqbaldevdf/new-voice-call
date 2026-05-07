@@ -15,6 +15,14 @@ function getSignalingServerUrl() {
 
 const SIGNALING_SERVER_URL = getSignalingServerUrl();
 
+const HEARING_OPTIONS = [
+  { value: "en", label: "English" },
+  { value: "hi", label: "Hindi" },
+  { value: "ta", label: "Tamil" },
+];
+
+const DIRECT_AUDIO_MODES = new Set(["original", "en"]);
+
 /* ─────────────────────────────────────────────────────────────────────────────
    GLOBAL STYLES  — injected once into <head>
 ───────────────────────────────────────────────────────────────────────────── */
@@ -189,6 +197,7 @@ function App() {
   const [logs, setLogs]               = useState([]);
   const [transcripts, setTranscripts] = useState([]);
   const [showLogs, setShowLogs]       = useState(false);
+  const [targetLang, setTargetLang]   = useState("original");
 
   // ── NEW: pending mute UI state ─────────────────────────────────────────────
   // Shows a visual indicator "Finishing speech before muting..."
@@ -200,11 +209,16 @@ function App() {
   const localStreamRef = useRef(null);
   const roomIdRef      = useRef("");
   const micMutedRef    = useRef(false);
+  const targetLangRef  = useRef("original");
   const callStartedRef = useRef(false);
   const nameRef        = useRef("");
   const aaiSocketRef   = useRef(null);
   const audioCtxRef    = useRef(null);
   const processorRef   = useRef(null);
+  const remoteAudioRef = useRef(null);
+  const peerConnectionRef = useRef(null);
+  const peerIdRef = useRef(null);
+  const remoteStreamRef = useRef(new MediaStream());
 
   // ── NEW: pending mute ref ──────────────────────────────────────────────────
   // true = mute was requested but we are waiting for AAI end_of_turn
@@ -224,10 +238,100 @@ function App() {
   useEffect(() => { micMutedRef.current    = micMuted;    }, [micMuted]);
   useEffect(() => { callStartedRef.current = callStarted; }, [callStarted]);
   useEffect(() => { nameRef.current        = name;        }, [name]);
+  useEffect(() => { targetLangRef.current  = targetLang;  }, [targetLang]);
+  useEffect(() => {
+    if (DIRECT_AUDIO_MODES.has(targetLang)) stopTtsPlayback();
+    syncRemoteAudioMode();
+  }, [targetLang]);
+  useEffect(() => () => {
+    stopTtsPlayback();
+    teardownPeerConnection();
+  }, []);
+
+  const currentHearingLabel =
+    HEARING_OPTIONS.find((option) => option.value === targetLang)?.label || "Hear Original";
+
+  function stopTtsPlayback() {
+    ttsQueueRef.current = [];
+    ttsPlayingRef.current = false;
+  }
+
+  function syncRemoteAudioMode() {
+    const remoteEl = remoteAudioRef.current;
+    if (!remoteEl) return;
+    remoteEl.muted = !DIRECT_AUDIO_MODES.has(targetLangRef.current);
+    remoteEl.volume = 1;
+  }
+
+  function teardownPeerConnection() {
+    if (peerConnectionRef.current) {
+      peerConnectionRef.current.ontrack = null;
+      peerConnectionRef.current.onicecandidate = null;
+      peerConnectionRef.current.close();
+      peerConnectionRef.current = null;
+    }
+    peerIdRef.current = null;
+    remoteStreamRef.current = new MediaStream();
+    if (remoteAudioRef.current) remoteAudioRef.current.srcObject = null;
+  }
+
+  function ensurePeerConnection(peerId) {
+    if (!socketRef.current || !localStreamRef.current) return null;
+    if (peerConnectionRef.current && peerIdRef.current === peerId) return peerConnectionRef.current;
+    teardownPeerConnection();
+
+    const pc = new RTCPeerConnection({
+      iceServers: [{ urls: "stun:stun.l.google.com:19302" }],
+    });
+    peerConnectionRef.current = pc;
+    peerIdRef.current = peerId;
+    remoteStreamRef.current = new MediaStream();
+
+    pc.ontrack = (event) => {
+      event.streams[0]?.getTracks().forEach((track) => remoteStreamRef.current.addTrack(track));
+      if (remoteAudioRef.current) {
+        remoteAudioRef.current.srcObject = remoteStreamRef.current;
+        syncRemoteAudioMode();
+        remoteAudioRef.current.play().catch(() => {});
+      }
+    };
+
+    pc.onicecandidate = (event) => {
+      if (!event.candidate || !socketRef.current || !peerIdRef.current) return;
+      socketRef.current.emit("ice-candidate", { candidate: event.candidate, to: peerIdRef.current });
+    };
+
+    localStreamRef.current.getTracks().forEach((track) => pc.addTrack(track, localStreamRef.current));
+    return pc;
+  }
+
+  async function createOfferForPeer(peerId) {
+    const pc = ensurePeerConnection(peerId);
+    if (!pc || !socketRef.current) return;
+    const offer = await pc.createOffer({ offerToReceiveAudio: true });
+    await pc.setLocalDescription(offer);
+    socketRef.current.emit("offer", { offer, to: peerId, name: nameRef.current });
+  }
+
+  function handleHearingModeChange(nextMode) {
+    setTargetLang(nextMode);
+    targetLangRef.current = nextMode;
+    if (DIRECT_AUDIO_MODES.has(nextMode)) stopTtsPlayback();
+    syncRemoteAudioMode();
+
+    if (joined && socketRef.current) {
+      socketRef.current.emit("update-lang", { targetLang: nextMode });
+      addLog(`Hearing mode set to ${nextMode}`);
+    }
+  }
 
   // ── TTS queue (unchanged) ─────────────────────────────────────────────────
   playNextFromQueueRef.current = function playNextFromQueue() {
     if (ttsPlayingRef.current || ttsQueueRef.current.length === 0) return;
+    if (DIRECT_AUDIO_MODES.has(targetLangRef.current)) {
+      stopTtsPlayback();
+      return;
+    }
     const item = ttsQueueRef.current.shift();
     if (!item?.audioBase64) return;
     try {
@@ -252,6 +356,7 @@ function App() {
   };
 
   function enqueueAudio(audioBase64, mimeType = "audio/mpeg") {
+    if (DIRECT_AUDIO_MODES.has(targetLangRef.current)) return;
     ttsQueueRef.current.push({ audioBase64, mimeType });
     playNextFromQueueRef.current();
   }
@@ -427,7 +532,11 @@ function App() {
     socket.on("connect", () => {
       setStatus("Connected. Joining room...");
       addLog("Connected. Joining " + roomIdRef.current);
-      socket.emit("join-room", { roomId: roomIdRef.current, name });
+      socket.emit("join-room", {
+        roomId: roomIdRef.current,
+        name,
+        targetLang: targetLangRef.current,
+      });
     });
     socket.on("connect_error", (err) => addLog("Socket error: " + (err.message || String(err))));
     socket.on("all-users", (users) => {
@@ -443,6 +552,49 @@ function App() {
       addLog(`Joined: ${id} (${rn || "Remote User"})`);
       setOtherUserId(id); setRemoteName(rn || "Remote User");
       setStatus("Peer in room. You can Start Call.");
+      if (callStartedRef.current) {
+        createOfferForPeer(id).catch((err) => addLog("Offer failed: " + (err.message || String(err))));
+      }
+    });
+    socket.on("user-left", (leftUserId) => {
+      const isPeerLeaving = peerIdRef.current === leftUserId;
+      if (isPeerLeaving) teardownPeerConnection();
+      setOtherUserId((prev) => (prev === leftUserId ? null : prev));
+      setRemoteName((prev) => (isPeerLeaving ? "" : prev));
+      addLog("Peer left the room.");
+    });
+    socket.on("lang-updated", ({ targetLang: updatedLang }) => {
+      addLog(`Server updated hearing mode: ${updatedLang}`);
+    });
+    socket.on("offer", async ({ offer, from, name: fromName }) => {
+      try {
+        setOtherUserId(from);
+        setRemoteName(fromName || "Remote User");
+        const pc = ensurePeerConnection(from);
+        if (!pc) return;
+        await pc.setRemoteDescription(new RTCSessionDescription(offer));
+        const answer = await pc.createAnswer();
+        await pc.setLocalDescription(answer);
+        socket.emit("answer", { answer, to: from });
+      } catch (err) {
+        addLog("Offer handling failed: " + (err.message || String(err)));
+      }
+    });
+    socket.on("answer", async ({ answer, from }) => {
+      try {
+        if (!peerConnectionRef.current || peerIdRef.current !== from) return;
+        await peerConnectionRef.current.setRemoteDescription(new RTCSessionDescription(answer));
+      } catch (err) {
+        addLog("Answer handling failed: " + (err.message || String(err)));
+      }
+    });
+    socket.on("ice-candidate", async ({ candidate, from }) => {
+      try {
+        if (!peerConnectionRef.current || peerIdRef.current !== from || !candidate) return;
+        await peerConnectionRef.current.addIceCandidate(new RTCIceCandidate(candidate));
+      } catch (err) {
+        addLog("ICE handling failed: " + (err.message || String(err)));
+      }
     });
     socket.on("transcript", ({ from, name: fn, text, translationMs }) => {
       if (!text) return;
@@ -469,6 +621,10 @@ function App() {
     addLog("Starting call – AssemblyAI Universal Streaming.");
     setCallStarted(true);
     callStartedRef.current = true;
+    syncRemoteAudioMode();
+    await createOfferForPeer(otherUserId).catch((err) =>
+      addLog("Offer start failed: " + (err.message || String(err)))
+    );
     await startAssemblyAI(localStreamRef.current);
   };
 
@@ -521,6 +677,8 @@ function App() {
     callStartedRef.current = false;
     setCallStarted(false);
     stopAssemblyAI();
+    stopTtsPlayback();
+    teardownPeerConnection();
     setStatus("Call ended.");
     addLog("Call ended.");
   };
@@ -541,7 +699,7 @@ function App() {
         <div className="vb-topbar">
           <div style={{ display:"flex", alignItems:"center" }}>
             <span className="vb-logo">Voice<b>Bridge</b></span>
-            <span className="vb-badge">EN → HI Translator</span>
+            <span className="vb-badge">{currentHearingLabel}</span>
           </div>
           <span className="vb-time">{clock}</span>
         </div>
@@ -550,7 +708,7 @@ function App() {
             <div>
               <div className="vb-card-title">Join a call</div>
               <div className="vb-card-sub" style={{ marginTop:6 }}>
-                Real-time English → Hindi translation
+                Choose how you want to hear the other person
               </div>
             </div>
             <div className="vb-field">
@@ -564,6 +722,15 @@ function App() {
               <input className="vb-finput" placeholder="Enter room ID"
                 value={roomId} onChange={e => setRoomId(e.target.value)}
                 onKeyDown={e => e.key==="Enter" && roomId && name && joinRoom()} />
+            </div>
+            <div className="vb-field">
+              <div className="vb-flabel">I want to hear in</div>
+              <select className="vb-finput" value={targetLang}
+                onChange={e => handleHearingModeChange(e.target.value)}>
+                {HEARING_OPTIONS.map((option) => (
+                  <option key={option.value} value={option.value}>{option.label}</option>
+                ))}
+              </select>
             </div>
             <button className="vb-join-btn" onClick={joinRoom} disabled={!roomId || !name}>
               Join Now
@@ -587,10 +754,10 @@ function App() {
       <div className="vb-topbar">
         <div style={{ display:"flex", alignItems:"center", gap:8 }}>
           <span className="vb-logo">Voice<b>Bridge</b></span>
-          <span className="vb-badge">EN → HI</span>
+          <span className="vb-badge">{currentHearingLabel}</span>
           {callStarted && (
             <span className="vb-chip">
-              <span className="dot blue" /> Live Translation
+              <span className="dot blue" /> {DIRECT_AUDIO_MODES.has(targetLang) ? "Original voice" : "Live translation"}
             </span>
           )}
           {/* ✅ NEW: pending mute badge — shows while waiting for sentence to finish */}
@@ -669,7 +836,9 @@ function App() {
               {transcripts.length === 0 ? (
                 <div className="vb-empty">
                   Start the call and speak —<br />
-                  transcripts appear here in real time.
+                  {DIRECT_AUDIO_MODES.has(targetLang)
+                    ? "original transcript appears here in real time."
+                    : "translated transcript appears here in real time."}
                 </div>
               ) : (
                 transcripts.map((t, i) => (
@@ -686,6 +855,16 @@ function App() {
                 ))
               )}
               <div ref={transcriptEndRef} />
+            </div>
+            <div style={{ padding:"10px 12px", borderTop:"1px solid #3c4043", display:"flex", alignItems:"center", gap:8 }}>
+              <span style={{ fontSize:11, color:"#9aa0a6", whiteSpace:"nowrap" }}>Hearing in</span>
+              <select className="vb-finput" style={{ padding:"7px 10px", fontSize:12 }}
+                value={targetLang}
+                onChange={e => handleHearingModeChange(e.target.value)}>
+                {HEARING_OPTIONS.map((option) => (
+                  <option key={option.value} value={option.value}>{option.label}</option>
+                ))}
+              </select>
             </div>
           </div>
 
@@ -762,7 +941,7 @@ function App() {
           {callStarted ? (
             <>
               <div style={{ display:"flex", alignItems:"center", gap:5, color:"#34a853", fontSize:12 }}>
-                <span className="dot" /> Translating EN → HI
+                <span className="dot" /> {DIRECT_AUDIO_MODES.has(targetLang) ? "Hearing original voice" : `Hearing in ${currentHearingLabel}`}
               </div>
             </>
           ) : (
@@ -774,6 +953,7 @@ function App() {
       </div>
 
       <audio ref={localAudioRef} autoPlay muted playsInline style={{ display:"none" }} />
+      <audio ref={remoteAudioRef} autoPlay playsInline style={{ display:"none" }} />
     </div>
   );
 }
