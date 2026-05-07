@@ -283,7 +283,7 @@ function App() {
 
     aaiWs.onopen = () => {
       addLog("AssemblyAI WS open.");
-      setStatus("🎙 Listening...");
+      setStatus(micMutedRef.current ? "🔇 Microphone muted" : "🎙 Listening...");
 
       const audioCtx  = new AudioContext({ sampleRate: 16000 });
       audioCtxRef.current = audioCtx;
@@ -345,8 +345,11 @@ function App() {
       if (data.type === "Begin") addLog("AssemblyAI session: " + data.id);
 
       // Partial transcript — show in status bar
-      if (data.type === "Turn" && !data.end_of_turn && data.transcript?.trim())
-        setStatus("🎙 Hearing: " + data.transcript);
+      if (data.type === "Turn" && !data.end_of_turn && data.transcript?.trim()) {
+        if (!micMutedRef.current || pendingMuteRef.current) {
+          setStatus("🎙 Hearing: " + data.transcript);
+        }
+      }
 
       // Final transcript — send to backend for translate + TTS
       if (data.type === "Turn" && data.end_of_turn && data.transcript?.trim()) {
@@ -367,6 +370,7 @@ function App() {
           // Disable the hardware mic track
           localStreamRef.current?.getAudioTracks()
             .forEach(t => (t.enabled = false));
+          setStatus("🔇 Microphone muted");
           addLog("Mic muted — all pending audio sent to AAI ✅");
         }
         // ── END PENDING MUTE ──────────────────────────────────────────────────
@@ -479,6 +483,7 @@ function App() {
       tracks.forEach(t => (t.enabled = true));
       micMutedRef.current = false;
       setMicMuted(false);
+      setStatus(callStartedRef.current ? "🎙 Listening..." : status);
       // clear any pending mute state too
       pendingMuteRef.current = false;
       setPendingMuteUI(false);
@@ -504,6 +509,7 @@ function App() {
         tracks.forEach(t => (t.enabled = false));
         micMutedRef.current = true;
         setMicMuted(true);
+        setStatus("🔇 Microphone muted");
         addLog("Microphone muted");
       }
       // ── END MUTE ──────────────────────────────────────────────────────────
@@ -522,9 +528,10 @@ function App() {
   /* ═══════════════════════════════════════════════════════════════════════════
      JSX
   ═══════════════════════════════════════════════════════════════════════════ */
-  const isHearing = status.startsWith("🎙 Hearing:");
+  const statusForNavbar = micMuted && !pendingMuteUI ? "🔇 Microphone muted" : status;
+  const isHearing = statusForNavbar.startsWith("🎙 Hearing:");
   const hearingSnippet = isHearing
-    ? status.replace("🎙 Hearing: ", "").slice(0, 32) + (status.length > 40 ? "…" : "")
+    ? statusForNavbar.replace("🎙 Hearing: ", "").slice(0, 32) + (statusForNavbar.length > 40 ? "…" : "")
     : "";
 
   /* ── LOBBY ── */
@@ -599,8 +606,8 @@ function App() {
               <span className="dot blue" /> {hearingSnippet}
             </span>
           )}
-          {!isHearing && status && (
-            <span style={{ fontSize:12, color:"#9aa0a6" }}>{status}</span>
+          {!isHearing && statusForNavbar && (
+            <span style={{ fontSize:12, color:"#9aa0a6" }}>{statusForNavbar}</span>
           )}
           <span className="vb-time">{clock}</span>
         </div>
@@ -757,7 +764,6 @@ function App() {
               <div style={{ display:"flex", alignItems:"center", gap:5, color:"#34a853", fontSize:12 }}>
                 <span className="dot" /> Translating EN → HI
               </div>
-              <div style={{ color:"#5f6368" }}>Powered by ElevenLabs</div>
             </>
           ) : (
             <div style={{ color:"#5f6368", fontSize:12 }}>
