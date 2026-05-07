@@ -26,6 +26,19 @@ const LANGUAGES = [
   { value: "ar", label: "Arabic"  },
 ];
 
+const AUDIO_CONSTRAINTS = {
+  channelCount: 1,
+  echoCancellation: true,
+  noiseSuppression: true,
+  autoGainControl: true,
+};
+
+const PCM_PEAK_THRESHOLD = 900;
+const PCM_RMS_THRESHOLD = 180;
+const VAD_HANGOVER_CHUNKS = 2;
+const MUTE_FLUSH_MAX_CHUNKS = 2;
+const MUTE_FLUSH_TIMEOUT_MS = 700;
+
 const CSS = `
 @import url('https://fonts.googleapis.com/css2?family=Google+Sans:wght@400;500;600&display=swap');
 *,*::before,*::after{box-sizing:border-box;margin:0;padding:0}
@@ -247,17 +260,34 @@ function App() {
   const workletNodeRef   = useRef(null);
   const audioActiveRef   = useRef(false);
   const pendingMuteRef   = useRef(false);
+  const muteFlushTimerRef = useRef(null);
+  const pendingMuteChunksRef = useRef(0);
+  const vadHangoverRef = useRef(0);
   const langSelectRef    = useRef(null); // for flash animation
 
   const ttsQueueRef          = useRef([]);
   const ttsPlayingRef        = useRef(false);
+  const currentTtsAudioRef   = useRef(null);
   const playNextFromQueueRef = useRef(null);
   const transcriptEndRef     = useRef(null);
+  const peerConnectionRef    = useRef(null);
+  const peerIdRef            = useRef(null);
+  const remoteAudioRef       = useRef(null);
+  const remoteStreamRef      = useRef(new MediaStream());
 
   useEffect(()=>{ transcriptEndRef.current?.scrollIntoView({behavior:"smooth"}); },[transcripts]);
   useEffect(()=>{ micMutedRef.current = micMuted; },[micMuted]);
   useEffect(()=>{ nameRef.current     = name;     },[name]);
   useEffect(()=>{ otherUserIdRef.current = otherUserId; },[otherUserId]);
+  useEffect(() => {
+    syncRemoteAudioMode();
+    if (targetLang === "en") stopTtsPlayback();
+  }, [targetLang]);
+  useEffect(() => () => {
+    clearMuteFlushTimer();
+    stopTtsPlayback();
+    teardownPeerConnection();
+  }, []);
 
   // ── showToast helper ──────────────────────────────────────────────────────
   function showToast(msg) {
@@ -265,6 +295,103 @@ function App() {
     setToastVisible(true);
     if (toastTimerRef.current) clearTimeout(toastTimerRef.current);
     toastTimerRef.current = setTimeout(() => setToastVisible(false), 2500);
+  }
+
+  function clearMuteFlushTimer() {
+    if (muteFlushTimerRef.current) {
+      clearTimeout(muteFlushTimerRef.current);
+      muteFlushTimerRef.current = null;
+    }
+  }
+
+  function stopTtsPlayback() {
+    ttsQueueRef.current = [];
+    const activeAudio = currentTtsAudioRef.current;
+    if (activeAudio) {
+      activeAudio.pause();
+      activeAudio.src = "";
+      currentTtsAudioRef.current = null;
+    }
+    ttsPlayingRef.current = false;
+  }
+
+  function finalizeDeferredMute(reason) {
+    if (!pendingMuteRef.current) return;
+    pendingMuteRef.current = false;
+    pendingMuteChunksRef.current = 0;
+    clearMuteFlushTimer();
+    setPendingMuteUI(false);
+    micMutedRef.current = true;
+    audioActiveRef.current = false;
+    localStreamRef.current?.getAudioTracks().forEach(t => (t.enabled = false));
+    addLog(reason === "timeout" ? "🔇 Mic muted (flush timeout reached)" : "✅ Mic muted after flush");
+  }
+
+  function syncRemoteAudioMode() {
+    const remoteEl = remoteAudioRef.current;
+    if (!remoteEl) return;
+    remoteEl.muted = targetLangRef.current !== "en";
+    remoteEl.volume = 1;
+  }
+
+  function teardownPeerConnection() {
+    if (peerConnectionRef.current) {
+      peerConnectionRef.current.ontrack = null;
+      peerConnectionRef.current.onicecandidate = null;
+      peerConnectionRef.current.onconnectionstatechange = null;
+      peerConnectionRef.current.close();
+      peerConnectionRef.current = null;
+    }
+    peerIdRef.current = null;
+    remoteStreamRef.current = new MediaStream();
+    if (remoteAudioRef.current) remoteAudioRef.current.srcObject = null;
+  }
+
+  function ensurePeerConnection(peerId) {
+    if (!socketRef.current || !localStreamRef.current) return null;
+    if (peerConnectionRef.current && peerIdRef.current === peerId) return peerConnectionRef.current;
+    teardownPeerConnection();
+
+    const pc = new RTCPeerConnection({
+      iceServers: [{ urls: "stun:stun.l.google.com:19302" }],
+    });
+    peerConnectionRef.current = pc;
+    peerIdRef.current = peerId;
+    remoteStreamRef.current = new MediaStream();
+
+    pc.ontrack = (event) => {
+      event.streams[0]?.getTracks().forEach((track) => {
+        remoteStreamRef.current.addTrack(track);
+      });
+      if (remoteAudioRef.current) {
+        remoteAudioRef.current.srcObject = remoteStreamRef.current;
+        syncRemoteAudioMode();
+        remoteAudioRef.current.play().catch(() => {});
+      }
+    };
+
+    pc.onicecandidate = (event) => {
+      if (!event.candidate || !socketRef.current || !peerIdRef.current) return;
+      socketRef.current.emit("ice-candidate", { to: peerIdRef.current, candidate: event.candidate });
+    };
+
+    pc.onconnectionstatechange = () => {
+      const state = pc.connectionState;
+      if (state === "disconnected" || state === "failed" || state === "closed") {
+        addLog("Peer audio connection closed.");
+      }
+    };
+
+    localStreamRef.current.getTracks().forEach((track) => pc.addTrack(track, localStreamRef.current));
+    return pc;
+  }
+
+  async function createOfferForPeer(peerId) {
+    const pc = ensurePeerConnection(peerId);
+    if (!pc || !socketRef.current) return;
+    const offer = await pc.createOffer({ offerToReceiveAudio: true });
+    await pc.setLocalDescription(offer);
+    socketRef.current.emit("offer", { offer, to: peerId, name: nameRef.current });
   }
 
   // ── handleLangChange — called both from lobby and in-call dropdown ─────────
@@ -292,7 +419,7 @@ function App() {
 
       const label = LANGUAGES.find(l => l.value === newLang)?.label || newLang;
       showToast(newLang === "en"
-        ? "Switched to transcript only (no translation)"
+        ? "Switched to original voice mode"
         : `Now hearing in ${label}`);
     }
   }
@@ -300,6 +427,10 @@ function App() {
   // ── TTS queue ─────────────────────────────────────────────────────────────
   playNextFromQueueRef.current = function playNextFromQueue() {
     if (ttsPlayingRef.current || ttsQueueRef.current.length === 0) return;
+    if (targetLangRef.current === "en") {
+      stopTtsPlayback();
+      return;
+    }
     const item = ttsQueueRef.current.shift();
     if (!item?.audioBase64) return;
     try {
@@ -309,15 +440,28 @@ function App() {
       const blob  = new Blob([bytes], { type: item.mimeType || "audio/mpeg" });
       const url   = URL.createObjectURL(blob);
       const audio = new Audio();
+      currentTtsAudioRef.current = audio;
       ttsPlayingRef.current = true;
       audio.onended = () => {
         URL.revokeObjectURL(url);
+        currentTtsAudioRef.current = null;
         setTimeout(() => { ttsPlayingRef.current = false; playNextFromQueueRef.current(); }, 300);
       };
-      audio.onerror = () => { URL.revokeObjectURL(url); ttsPlayingRef.current = false; playNextFromQueueRef.current(); };
+      audio.onerror = () => {
+        URL.revokeObjectURL(url);
+        currentTtsAudioRef.current = null;
+        ttsPlayingRef.current = false;
+        playNextFromQueueRef.current();
+      };
       audio.src = url;
-      audio.play().catch(() => { URL.revokeObjectURL(url); ttsPlayingRef.current = false; playNextFromQueueRef.current(); });
+      audio.play().catch(() => {
+        URL.revokeObjectURL(url);
+        currentTtsAudioRef.current = null;
+        ttsPlayingRef.current = false;
+        playNextFromQueueRef.current();
+      });
     } catch {
+      currentTtsAudioRef.current = null;
       ttsPlayingRef.current = false;
       playNextFromQueueRef.current();
     }
@@ -376,22 +520,34 @@ function App() {
 
       workletNode.port.onmessage = (event) => {
         const int16Buffer = event.data;
-        if (ttsPlayingRef.current) return;
         if (aaiWs.readyState !== WebSocket.OPEN) return;
 
         const int16View = new Int16Array(int16Buffer);
-        let hasAudio = false;
+        let peak = 0;
+        let power = 0;
         for (let i = 0; i < int16View.length; i++) {
-          if (Math.abs(int16View[i]) > 327) { hasAudio = true; break; }
+          const abs = Math.abs(int16View[i]);
+          if (abs > peak) peak = abs;
+          power += int16View[i] * int16View[i];
         }
+        const rms = Math.sqrt(power / Math.max(1, int16View.length));
+        const hasAudio = peak >= PCM_PEAK_THRESHOLD || rms >= PCM_RMS_THRESHOLD;
+        if (hasAudio) vadHangoverRef.current = VAD_HANGOVER_CHUNKS;
+        else if (vadHangoverRef.current > 0) vadHangoverRef.current -= 1;
+        const shouldSend = hasAudio || vadHangoverRef.current > 0;
 
         if (micMutedRef.current && !pendingMuteRef.current) return;
         if (micMutedRef.current && pendingMuteRef.current) {
-          if (hasAudio) { aaiWs.send(int16Buffer); addLog("🔁 Flushed last chunk"); }
+          if (shouldSend && pendingMuteChunksRef.current > 0) {
+            aaiWs.send(int16Buffer);
+            pendingMuteChunksRef.current -= 1;
+          }
+          if (pendingMuteChunksRef.current <= 0) finalizeDeferredMute("flush");
           return;
         }
 
-        audioActiveRef.current = hasAudio;
+        audioActiveRef.current = shouldSend;
+        if (!shouldSend) return;
         aaiWs.send(int16Buffer);
       };
 
@@ -441,6 +597,9 @@ function App() {
 
   function stopAssemblyAI() {
     callStartedRef.current = false;
+    clearMuteFlushTimer();
+    pendingMuteChunksRef.current = 0;
+    vadHangoverRef.current = 0;
     if (aaiSocketRef.current && aaiSocketRef.current.readyState === WebSocket.OPEN) {
       try { aaiSocketRef.current.send(JSON.stringify({ type: "Terminate" })); } catch (_) {}
       aaiSocketRef.current.close();
@@ -469,7 +628,7 @@ function App() {
 
     let localStream;
     try {
-      localStream = await navigator.mediaDevices.getUserMedia({ audio: true });
+      localStream = await navigator.mediaDevices.getUserMedia({ audio: AUDIO_CONSTRAINTS });
     } catch (err) {
       let msg = "Could not access microphone.";
       if (err.name === "NotAllowedError"    || err.name === "PermissionDeniedError")
@@ -539,6 +698,40 @@ function App() {
       setOtherUserId(id);
       setRemoteName(rn || "Remote User");
       addLog(`${rn || "Remote User"} joined.`);
+      createOfferForPeer(id).catch((err) => addLog(`Offer failed: ${err.message || err}`));
+    });
+
+    socket.on("offer", async ({ offer, from, name: fromName }) => {
+      try {
+        setOtherUserId(from);
+        setRemoteName(fromName || "Remote User");
+        const pc = ensurePeerConnection(from);
+        if (!pc) return;
+        await pc.setRemoteDescription(new RTCSessionDescription(offer));
+        const answer = await pc.createAnswer();
+        await pc.setLocalDescription(answer);
+        socket.emit("answer", { answer, to: from });
+      } catch (err) {
+        addLog(`Offer handling failed: ${err.message || err}`);
+      }
+    });
+
+    socket.on("answer", async ({ answer, from }) => {
+      try {
+        if (!peerConnectionRef.current || peerIdRef.current !== from) return;
+        await peerConnectionRef.current.setRemoteDescription(new RTCSessionDescription(answer));
+      } catch (err) {
+        addLog(`Answer handling failed: ${err.message || err}`);
+      }
+    });
+
+    socket.on("ice-candidate", async ({ candidate, from }) => {
+      try {
+        if (!peerConnectionRef.current || peerIdRef.current !== from || !candidate) return;
+        await peerConnectionRef.current.addIceCandidate(new RTCIceCandidate(candidate));
+      } catch (err) {
+        addLog(`ICE candidate error: ${err.message || err}`);
+      }
     });
 
     socket.on("user-left", (leftUserId) => {
@@ -546,8 +739,8 @@ function App() {
       setOtherUserId(null);
       otherUserIdRef.current = null;
       setRemoteName("");
-      ttsQueueRef.current = [];
-      ttsPlayingRef.current = false;
+      stopTtsPlayback();
+      teardownPeerConnection();
       addLog("Peer left the call.");
     });
 
@@ -557,6 +750,7 @@ function App() {
     });
 
     socket.on("tts-audio", ({ from, name: fn, audioBase64, mimeType, ttsMs }) => {
+      if (targetLangRef.current === "en") return;
       if (!audioBase64) return;
       addLog(`Audio from ${fn} (${ttsMs || 0}ms)`);
       enqueueAudio(audioBase64, mimeType || "audio/mpeg");
@@ -575,10 +769,12 @@ function App() {
     if (!tracks.length) return;
 
     if (micMuted) {
+      clearMuteFlushTimer();
       tracks.forEach(t => (t.enabled = true));
       micMutedRef.current    = false;
       audioActiveRef.current = false;
       pendingMuteRef.current = false;
+      pendingMuteChunksRef.current = 0;
       setPendingMuteUI(false);
       setMicMuted(false);
       addLog("Microphone unmuted");
@@ -586,15 +782,23 @@ function App() {
       const hasPendingAudio =
         status.startsWith("🎙 Hearing:") || audioActiveRef.current;
       if (hasPendingAudio) {
+        clearMuteFlushTimer();
         pendingMuteRef.current = true;
+        pendingMuteChunksRef.current = MUTE_FLUSH_MAX_CHUNKS;
         setPendingMuteUI(true);
         setMicMuted(true);
         micMutedRef.current = true;
+        muteFlushTimerRef.current = setTimeout(() => {
+          finalizeDeferredMute("timeout");
+        }, MUTE_FLUSH_TIMEOUT_MS);
         addLog("⏳ Mute deferred — flushing...");
       } else {
+        clearMuteFlushTimer();
         tracks.forEach(t => (t.enabled = false));
         micMutedRef.current    = true;
         audioActiveRef.current = false;
+        pendingMuteRef.current = false;
+        pendingMuteChunksRef.current = 0;
         setMicMuted(true);
         addLog("🔇 Microphone muted");
       }
@@ -604,6 +808,9 @@ function App() {
   // ── endCall ───────────────────────────────────────────────────────────────
   const endCall = () => {
     stopAssemblyAI();
+    stopTtsPlayback();
+    teardownPeerConnection();
+    clearMuteFlushTimer();
     if (socketRef.current) { socketRef.current.disconnect(); socketRef.current = null; }
     if (localStreamRef.current) {
       localStreamRef.current.getTracks().forEach(t => t.stop());
@@ -671,7 +878,7 @@ function App() {
               </select>
               <div style={{ fontSize:11, color:"#5f6368", marginTop:4 }}>
                 {targetLang === "en"
-                  ? "Others' speech will appear as transcript only — no audio translation"
+                  ? "Others' original voice plays directly — no translation"
                   : `Others' English speech will be translated to ${targetLangLabel} and played to you`}
               </div>
             </div>
@@ -706,7 +913,7 @@ function App() {
           <span className="vb-logo">Voice<b>Bridge</b></span>
           {translationActive
             ? <span className="vb-lang-badge">EN → {targetLang.toUpperCase()}</span>
-            : <span className="vb-notrans-badge">Transcript only</span>
+            : <span className="vb-notrans-badge">Original voice</span>
           }
           {pendingMuteUI && (
             <span className="vb-pending-mute">⏳ Finishing sentence...</span>
@@ -866,12 +1073,13 @@ function App() {
               <div style={{ color:"#5f6368" }}>Powered by ElevenLabs</div>
             </>
           ) : (
-            <div style={{ color:"#5f6368", fontSize:12 }}>Transcript only</div>
+            <div style={{ color:"#5f6368", fontSize:12 }}>Original voice mode</div>
           )}
         </div>
       </div>
 
       <audio ref={localAudioRef} autoPlay muted playsInline style={{ display:"none" }} />
+      <audio ref={remoteAudioRef} autoPlay playsInline style={{ display:"none" }} />
     </div>
   );
 }
