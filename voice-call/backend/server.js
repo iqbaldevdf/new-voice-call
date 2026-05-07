@@ -34,6 +34,7 @@ const ASSEMBLYAI_API_KEY  = process.env.ASSEMBLYAI_API_KEY || '';
 const LANGPAIR_MAP = {
   hi: "en|hi",
   ta: "en|ta",
+  es: "en|es",
 };
 
 // ── textToSpeech — unchanged ──────────────────────────────────────────────────

@@ -19,6 +19,7 @@ const HEARING_OPTIONS = [
   { value: "en", label: "English" },
   { value: "hi", label: "Hindi" },
   { value: "ta", label: "Tamil" },
+  { value: "es", label: "Spanish" },
 ];
 
 const DIRECT_AUDIO_MODES = new Set(["original", "en"]);
