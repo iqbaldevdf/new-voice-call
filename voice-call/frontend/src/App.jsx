@@ -38,6 +38,7 @@ const PCM_RMS_THRESHOLD = 180;
 const VAD_HANGOVER_CHUNKS = 2;
 const MUTE_FLUSH_MAX_CHUNKS = 2;
 const MUTE_FLUSH_TIMEOUT_MS = 700;
+const MUTE_FINAL_TRANSCRIPT_WAIT_MS = 1400;
 
 const CSS = `
 @import url('https://fonts.googleapis.com/css2?family=Google+Sans:wght@400;500;600&display=swap');
@@ -222,6 +223,7 @@ function App() {
   const [otherUserId, setOtherUserId]     = useState(null);
   const otherUserIdRef                  = useRef(null);
   const [micMuted, setMicMuted]           = useState(false);
+  const [speakerMuted, setSpeakerMuted]   = useState(false);
   const [logs, setLogs]                   = useState([]);
   const [transcripts, setTranscripts]     = useState([]);
   const [showLogs, setShowLogs]           = useState(false);
@@ -253,6 +255,7 @@ function App() {
   const localStreamRef   = useRef(null);
   const roomIdRef        = useRef("");
   const micMutedRef      = useRef(false);
+  const speakerMutedRef  = useRef(false);
   const callStartedRef   = useRef(false);
   const nameRef          = useRef("");
   const aaiSocketRef     = useRef(null);
@@ -260,7 +263,10 @@ function App() {
   const workletNodeRef   = useRef(null);
   const audioActiveRef   = useRef(false);
   const pendingMuteRef   = useRef(false);
+  const sttPausedForMuteRef = useRef(false);
   const muteFlushTimerRef = useRef(null);
+  const muteFinalizeTimerRef = useRef(null);
+  const awaitingMuteFinalTranscriptRef = useRef(false);
   const pendingMuteChunksRef = useRef(0);
   const vadHangoverRef = useRef(0);
   const langSelectRef    = useRef(null); // for flash animation
@@ -277,14 +283,16 @@ function App() {
 
   useEffect(()=>{ transcriptEndRef.current?.scrollIntoView({behavior:"smooth"}); },[transcripts]);
   useEffect(()=>{ micMutedRef.current = micMuted; },[micMuted]);
+  useEffect(()=>{ speakerMutedRef.current = speakerMuted; },[speakerMuted]);
   useEffect(()=>{ nameRef.current     = name;     },[name]);
   useEffect(()=>{ otherUserIdRef.current = otherUserId; },[otherUserId]);
   useEffect(() => {
     syncRemoteAudioMode();
     if (targetLang === "en") stopTtsPlayback();
-  }, [targetLang]);
+  }, [targetLang, speakerMuted]);
   useEffect(() => () => {
     clearMuteFlushTimer();
+    clearMuteFinalizeTimer();
     stopTtsPlayback();
     teardownPeerConnection();
   }, []);
@@ -304,6 +312,13 @@ function App() {
     }
   }
 
+  function clearMuteFinalizeTimer() {
+    if (muteFinalizeTimerRef.current) {
+      clearTimeout(muteFinalizeTimerRef.current);
+      muteFinalizeTimerRef.current = null;
+    }
+  }
+
   function stopTtsPlayback() {
     ttsQueueRef.current = [];
     const activeAudio = currentTtsAudioRef.current;
@@ -320,17 +335,27 @@ function App() {
     pendingMuteRef.current = false;
     pendingMuteChunksRef.current = 0;
     clearMuteFlushTimer();
+    clearMuteFinalizeTimer();
     setPendingMuteUI(false);
     micMutedRef.current = true;
     audioActiveRef.current = false;
     localStreamRef.current?.getAudioTracks().forEach(t => (t.enabled = false));
+    sttPausedForMuteRef.current = true;
+    awaitingMuteFinalTranscriptRef.current = true;
+    muteFinalizeTimerRef.current = setTimeout(() => {
+      awaitingMuteFinalTranscriptRef.current = false;
+      stopAssemblyAI();
+      setStatus("🔇 Microphone muted");
+      addLog("🔇 Mic muted (finalized without extra transcript)");
+    }, MUTE_FINAL_TRANSCRIPT_WAIT_MS);
+    setStatus("🔇 Microphone muted");
     addLog(reason === "timeout" ? "🔇 Mic muted (flush timeout reached)" : "✅ Mic muted after flush");
   }
 
   function syncRemoteAudioMode() {
     const remoteEl = remoteAudioRef.current;
     if (!remoteEl) return;
-    remoteEl.muted = targetLangRef.current !== "en";
+    remoteEl.muted = speakerMutedRef.current || targetLangRef.current !== "en";
     remoteEl.volume = 1;
   }
 
@@ -427,7 +452,7 @@ function App() {
   // ── TTS queue ─────────────────────────────────────────────────────────────
   playNextFromQueueRef.current = function playNextFromQueue() {
     if (ttsPlayingRef.current || ttsQueueRef.current.length === 0) return;
-    if (targetLangRef.current === "en") {
+    if (targetLangRef.current === "en" || speakerMutedRef.current) {
       stopTtsPlayback();
       return;
     }
@@ -468,6 +493,7 @@ function App() {
   };
 
   function enqueueAudio(audioBase64, mimeType = "audio/mpeg") {
+    if (speakerMutedRef.current) return;
     ttsQueueRef.current.push({ audioBase64, mimeType });
     playNextFromQueueRef.current();
   }
@@ -559,10 +585,27 @@ function App() {
       if (data.type === "Begin") addLog("AAI session: " + data.id);
 
       if (data.type === "Turn" && !data.end_of_turn && data.transcript?.trim())
-        setStatus("🎙 Hearing: " + data.transcript);
+        if (!micMutedRef.current || pendingMuteRef.current) setStatus("🎙 Hearing: " + data.transcript);
 
       if (data.type === "Turn" && data.end_of_turn && data.transcript?.trim()) {
         const text = data.transcript.trim();
+        if (micMutedRef.current && !pendingMuteRef.current) {
+          if (!awaitingMuteFinalTranscriptRef.current) {
+            setStatus("🔇 Microphone muted");
+            return;
+          }
+          awaitingMuteFinalTranscriptRef.current = false;
+          clearMuteFinalizeTimer();
+          addLog("Final (flush): " + text);
+          setTranscripts((prev) => [...prev, {
+            from: "me", name: nameRef.current, text, ts: Date.now()
+          }]);
+          socketRef.current.emit("transcript", { roomId: roomIdRef.current, text });
+          stopAssemblyAI();
+          setStatus("🔇 Microphone muted");
+          return;
+        }
+
         addLog("Final: " + text);
         setStatus("🎙 Listening...");
         audioActiveRef.current = false;
@@ -573,13 +616,6 @@ function App() {
 
         socketRef.current.emit("transcript", { roomId: roomIdRef.current, text });
 
-        if (pendingMuteRef.current) {
-          pendingMuteRef.current = false;
-          setPendingMuteUI(false);
-          micMutedRef.current = true;
-          localStreamRef.current?.getAudioTracks().forEach(t => (t.enabled = false));
-          addLog("✅ Mic muted after flush");
-        }
       }
 
       if (data.type === "Termination") addLog("AAI terminated.");
@@ -598,8 +634,10 @@ function App() {
   function stopAssemblyAI() {
     callStartedRef.current = false;
     clearMuteFlushTimer();
+    clearMuteFinalizeTimer();
     pendingMuteChunksRef.current = 0;
     vadHangoverRef.current = 0;
+    awaitingMuteFinalTranscriptRef.current = false;
     if (aaiSocketRef.current && aaiSocketRef.current.readyState === WebSocket.OPEN) {
       try { aaiSocketRef.current.send(JSON.stringify({ type: "Terminate" })); } catch (_) {}
       aaiSocketRef.current.close();
@@ -770,6 +808,8 @@ function App() {
 
     if (micMuted) {
       clearMuteFlushTimer();
+      clearMuteFinalizeTimer();
+      awaitingMuteFinalTranscriptRef.current = false;
       tracks.forEach(t => (t.enabled = true));
       micMutedRef.current    = false;
       audioActiveRef.current = false;
@@ -777,6 +817,15 @@ function App() {
       pendingMuteChunksRef.current = 0;
       setPendingMuteUI(false);
       setMicMuted(false);
+      setStatus("🎙 Listening...");
+      if (sttPausedForMuteRef.current && localStreamRef.current) {
+        sttPausedForMuteRef.current = false;
+        addLog("Resuming STT after unmute...");
+        stopAssemblyAI();
+        startAssemblyAI(localStreamRef.current).catch((err) =>
+          addLog("Failed to resume STT: " + (err?.message || String(err)))
+        );
+      }
       addLog("Microphone unmuted");
     } else {
       const hasPendingAudio =
@@ -792,6 +841,7 @@ function App() {
           finalizeDeferredMute("timeout");
         }, MUTE_FLUSH_TIMEOUT_MS);
         addLog("⏳ Mute deferred — flushing...");
+        setStatus("⏳ Muting...");
       } else {
         clearMuteFlushTimer();
         tracks.forEach(t => (t.enabled = false));
@@ -799,9 +849,25 @@ function App() {
         audioActiveRef.current = false;
         pendingMuteRef.current = false;
         pendingMuteChunksRef.current = 0;
+        sttPausedForMuteRef.current = true;
+        stopAssemblyAI();
         setMicMuted(true);
+        setStatus("🔇 Microphone muted");
         addLog("🔇 Microphone muted");
       }
+    }
+  };
+
+  const toggleSpeaker = () => {
+    const nextMuted = !speakerMutedRef.current;
+    setSpeakerMuted(nextMuted);
+    speakerMutedRef.current = nextMuted;
+    syncRemoteAudioMode();
+    if (nextMuted) {
+      stopTtsPlayback();
+      addLog("🔇 Speaker muted");
+    } else {
+      addLog("🔊 Speaker unmuted");
     }
   };
 
@@ -824,6 +890,9 @@ function App() {
     setTranscripts([]);
     setMicMuted(false);
     micMutedRef.current = false;
+    sttPausedForMuteRef.current = false;
+    setSpeakerMuted(false);
+    speakerMutedRef.current = false;
     setStatus("");
     addLog("Left call.");
   };
@@ -1054,6 +1123,17 @@ function App() {
           </div>
 
           <div className="cbtn-wrap">
+            <button
+              className={`cbtn ${speakerMuted ? "red" : "grey"}`}
+              onClick={toggleSpeaker}
+              title={speakerMuted ? "Unmute speaker" : "Mute speaker"}
+            >
+              {speakerMuted ? "🔇" : "🔊"}
+            </button>
+            <span>{speakerMuted ? "Unmute spk" : "Mute spk"}</span>
+          </div>
+
+          <div className="cbtn-wrap">
             <button className="cbtn danger" onClick={endCall} title="Leave call">📵</button>
             <span>Leave</span>
           </div>
@@ -1066,12 +1146,9 @@ function App() {
 
         <div className="vb-br">
           {translationActive ? (
-            <>
-              <div style={{ display:"flex", alignItems:"center", gap:5, color:"#34a853", fontSize:12 }}>
-                <span className="dot" /> Hearing in {targetLangLabel}
-              </div>
-              <div style={{ color:"#5f6368" }}>Powered by ElevenLabs</div>
-            </>
+            <div style={{ display:"flex", alignItems:"center", gap:5, color:"#34a853", fontSize:12 }}>
+              <span className="dot" /> Hearing in {targetLangLabel}
+            </div>
           ) : (
             <div style={{ color:"#5f6368", fontSize:12 }}>Original voice mode</div>
           )}
