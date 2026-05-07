@@ -31,11 +31,58 @@ app.use(express.json());
 const ELEVENLABS_API_KEY  = process.env.ELEVENLABS_API_KEY;
 const ELEVENLABS_VOICE_ID = process.env.ELEVENLABS_VOICE_ID || 'pNInz6obpgDQGcFmaJgB';
 const ASSEMBLYAI_API_KEY  = process.env.ASSEMBLYAI_API_KEY || '';
+const AAI_LLM_GATEWAY_URL = process.env.AAI_LLM_GATEWAY_URL || 'https://llm-gateway.assemblyai.com/v1/chat/completions';
+const AAI_LLM_MODEL       = process.env.AAI_LLM_MODEL || 'gemini-2.5-flash-lite';
 const LANGPAIR_MAP = {
   hi: "en|hi",
   ta: "en|ta",
   es: "en|es",
 };
+const LANG_CODE_MAP = {
+  en: "English",
+  hi: "Hindi",
+  ta: "Tamil",
+  es: "Spanish",
+};
+
+async function translateWithLlmGateway(text, targetLang) {
+  if (!text?.trim()) return text;
+  if (!targetLang || targetLang === "en" || targetLang === "original") return text;
+  if (!ASSEMBLYAI_API_KEY) throw new Error("ASSEMBLYAI_API_KEY is not configured");
+
+  const targetName = LANG_CODE_MAP[targetLang];
+  if (!targetName) return text;
+
+  const prompt = [
+    `Translate the following text into ${targetName}.`,
+    "Return only the translated text with no explanation and no quotes.",
+    `Text: ${text.trim()}`,
+  ].join("\n");
+
+  const response = await fetch(AAI_LLM_GATEWAY_URL, {
+    method: "POST",
+    headers: {
+      Authorization: ASSEMBLYAI_API_KEY,
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify({
+      model: AAI_LLM_MODEL,
+      messages: [{ role: "user", content: prompt }],
+      temperature: 0.1,
+      max_tokens: 500,
+    }),
+    signal: AbortSignal.timeout(12000),
+  });
+
+  if (!response.ok) {
+    const errBody = await response.text();
+    throw new Error(`LLM Gateway ${response.status}: ${errBody.slice(0, 180)}`);
+  }
+
+  const payload = await response.json();
+  const translated = payload?.choices?.[0]?.message?.content?.trim();
+  return translated || text;
+}
 
 // ── textToSpeech — unchanged ──────────────────────────────────────────────────
 async function textToSpeech(text) {
@@ -117,20 +164,16 @@ async function textToSpeech(text) {
   }
 }
 
-// ── GET /api/translate — unchanged ────────────────────────────────────────────
+// ── GET /api/translate — AssemblyAI LLM Gateway ──────────────────────────────
 app.get('/api/translate', async (req, res) => {
   const text = (req.query.text || req.query.q || 'Hello').trim();
+  const lang = (req.query.lang || 'hi').trim().toLowerCase();
   if (!text) {
     return res.status(400).json({ ok: false, error: 'Missing query: text or q' });
   }
   try {
-    const url = `https://api.mymemory.translated.net/get?q=${encodeURIComponent(text)}&langpair=en|hi`;
-    const fetchRes = await fetch(url, { signal: AbortSignal.timeout(5000) });
-    if (!fetchRes.ok) throw new Error(`MyMemory API returned ${fetchRes.status}`);
-    const data = await fetchRes.json();
-    const translated = data?.responseData?.translatedText;
-    const result = (typeof translated === 'string' && translated.trim()) ? translated.trim() : null;
-    return res.json({ ok: true, original: text, translated: result, from: 'en', to: 'hi' });
+    const translated = await translateWithLlmGateway(text, lang);
+    return res.json({ ok: true, original: text, translated, from: 'en', to: lang });
   } catch (err) {
     return res.status(502).json({ ok: false, error: err.message || 'Translation failed', original: text });
   }
@@ -241,14 +284,18 @@ io.on('connection', (socket) => {
       if (langpair) {
         const tTranslateStart = Date.now();
         try {
-          const translateUrl = `https://api.mymemory.translated.net/get?q=${encodeURIComponent(trimmed)}&langpair=${langpair}`;
-          const res = await fetch(translateUrl, { signal: AbortSignal.timeout(5000) });
-          if (res.ok) {
-            const data = await res.json();
-            const translated = data?.responseData?.translatedText;
-            if (typeof translated === "string" && translated.trim()) toSend = translated.trim();
-          }
+          toSend = await translateWithLlmGateway(trimmed, receiverLang);
         } catch (e) {
+          // Fallback to MyMemory only if LLM Gateway fails, to keep call alive.
+          try {
+            const translateUrl = `https://api.mymemory.translated.net/get?q=${encodeURIComponent(trimmed)}&langpair=${langpair}`;
+            const res = await fetch(translateUrl, { signal: AbortSignal.timeout(5000) });
+            if (res.ok) {
+              const data = await res.json();
+              const translated = data?.responseData?.translatedText;
+              if (typeof translated === "string" && translated.trim()) toSend = translated.trim();
+            }
+          } catch (_) {}
           console.error("[transcript] Translation failed:", e.message);
         }
         translationMs = Date.now() - tTranslateStart;
